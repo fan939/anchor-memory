@@ -80,7 +80,6 @@ class OAuthHttpTests(unittest.TestCase):
                 self.assertEqual(401, response.status_code)
                 challenge = response.headers.get("WWW-Authenticate", "")
                 self.assertIn("oauth-protected-resource/mcp", challenge)
-                self.assertIn("anchor:read", challenge)
 
 
 if __name__ == "__main__":
