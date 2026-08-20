@@ -51,6 +51,12 @@ class Auth0JWTVerifier(TokenVerifier):
             return None
 
         scopes = self._extract_scopes(claims)
+        missing_scopes = [scope for scope in OAUTH_SCOPES if scope not in scopes]
+        if missing_scopes:
+            logger.warning(
+                "OAuth access token is missing required Anchor scopes: %s",
+                ", ".join(missing_scopes),
+            )
         subject = claims.get("sub")
         if not isinstance(subject, str) or not subject:
             logger.warning("Rejected OAuth access token without a subject")
