@@ -86,12 +86,16 @@ class Auth0JWTVerifier(TokenVerifier):
 
     @staticmethod
     def _extract_scopes(claims: dict[str, Any]) -> list[str]:
-        scope = claims.get("scope") or claims.get("scp")
-        if isinstance(scope, str):
-            return scope.split()
-        if isinstance(scope, (list, tuple)):
-            return [str(item) for item in scope]
-        permissions = claims.get("permissions")
-        if isinstance(permissions, (list, tuple)):
-            return [str(item) for item in permissions]
-        return []
+        scopes: list[str] = []
+        for claim_name in ("scope", "scp", "permissions"):
+            value = claims.get(claim_name)
+            if isinstance(value, str):
+                candidates = value.split()
+            elif isinstance(value, (list, tuple)):
+                candidates = [str(item) for item in value]
+            else:
+                continue
+            for candidate in candidates:
+                if candidate and candidate not in scopes:
+                    scopes.append(candidate)
+        return scopes

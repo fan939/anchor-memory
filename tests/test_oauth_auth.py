@@ -24,6 +24,20 @@ class FakeMemory:
 
 @unittest.skipUnless(MCP_AVAILABLE, "MCP SDK is only installed in the HTTP test environment")
 class OAuthHttpTests(unittest.TestCase):
+    def test_scope_claims_are_combined_without_duplicates(self):
+        from anchor_auth import Auth0JWTVerifier
+
+        claims = {
+            "scope": "openid profile anchor:read",
+            "scp": ["anchor:read", "anchor:write"],
+            "permissions": ["anchor:write", "anchor:admin"],
+        }
+
+        self.assertEqual(
+            ["openid", "profile", "anchor:read", "anchor:write", "anchor:admin"],
+            Auth0JWTVerifier._extract_scopes(claims),
+        )
+
     def test_oauth_metadata_and_unauthorized_challenge(self):
         import anchor_http
         from starlette.testclient import TestClient
