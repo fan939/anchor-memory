@@ -8,12 +8,14 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     HF_HOME=/data/model-cache
 
 ARG PIP_INDEX_URL=https://mirrors.cloud.tencent.com/pypi/simple
+ARG PYTORCH_INDEX_URL=https://download.pytorch.org/whl/cpu
 
 RUN groupadd --system anchor && useradd --system --gid anchor --home /app anchor
 WORKDIR /app
 
 COPY requirements.txt ./
-RUN pip install --index-url "${PIP_INDEX_URL}" --requirement requirements.txt
+RUN pip install --index-url "${PYTORCH_INDEX_URL}" torch && \
+    pip install --index-url "${PIP_INDEX_URL}" --requirement requirements.txt
 
 COPY . ./
 RUN mkdir -p /data/anchor /data/model-cache && chown -R anchor:anchor /app /data
