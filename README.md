@@ -2,6 +2,10 @@
 
 Graph-structured memory for AI with Hebbian learning, emotion scoring, and dream consolidation.
 
+Stored material is contextual evidence, not an instruction or automatically
+confirmed truth. Event records and later interpretations remain separate and
+auditable; current conversation and newly supplied evidence take precedence.
+
 ## What is this?
 
 Most AI memory systems are search engines — store text, embed it, retrieve by similarity. Anchor treats memories as nodes in a graph, connected by weighted synaptic edges that strengthen through co-activation and decay through disuse.
@@ -25,7 +29,8 @@ Memories don't just get stored and retrieved. They **associate**.
 
 ### Hebbian Learning
 - "Neurons that fire together wire together."
-- When two memories are retrieved in the same search, they automatically form a weak connection (0.2).
+- Automatic co-retrieval strengthening is disabled by default. Set
+  `ANCHOR_AUTO_HEBBIAN=true` only after auditing retrieval quality.
 - Repeated co-retrieval strengthens the connection over time.
 
 ### Dream Pass
@@ -34,7 +39,8 @@ Run periodically (like sleep for the brain):
 - **Pruning**: Weak edges decay by 0.9x per pass. Edges below 0.1 are deleted.
 - **Strong edge decay**: Manual connections decay at 0.95x — they fade if not reinforced by Hebbian co-activation.
 - **Auto-discovery**: Randomly samples memories and connects semantically similar but unlinked ones.
-- **Emotion equilibration**: Connected memories nudge each other's emotion scores toward equilibrium.
+- **Emotion equilibration**: opt-in with `ANCHOR_EMOTION_EQUALIZATION=true`;
+  disabled by default to avoid amplifying accidental associations.
 
 ### Emotion Scoring
 - Each memory carries an `emotion_score` from 0.0 (neutral) to 1.0 (intense).
@@ -67,7 +73,7 @@ Run periodically (like sleep for the brain):
 
 ### Cross-Window Continuity (v1.12+)
 - **`anchor_proxy.py`** — an OpenAI-compatible proxy that sits between your frontend (Open WebUI, SillyTavern, LobeHub, …) and any OpenAI-compatible upstream, and makes continuity **machine-side**: every turn it injects the pinned layer (identity + session_state + recent_timeline), current time + interval, and per-turn memory recall; after every response it rewrites the previous-window tail (`last_session.md`) — so continuity survives crashes and closed tabs, and never depends on the model remembering to call a tool.
-- **Zero-LLM floor**: injection, tail, and recall need no LLM beyond your chat model. Two enhancements — intent-split recall and a background curator (judge-store + timeline events) — light up when you configure one via `ANCHOR_LLM` / `~/.anchor/config.yaml` (same BYO-LLM pattern as dream pass; the AI can ask you which provider and write the config itself).
+- **Zero-LLM floor**: injection, tail, and recall need no LLM beyond your chat model. Intent-split recall can use a configured `ANCHOR_LLM`. The background curator requires a separate explicit `ANCHOR_AUTO_CURATE=true` opt-in and remains off by default.
 - **Works without the proxy too**: on web/hosted clients (claude.ai etc.), plain MCP still gives you `wakeup()` cold start, `write_session_state` (the AI's own rolling state, auto-archived, continuity-headered), and all memory tools. Per-turn mechanics need the proxy or your own adapter.
 - **Built to be modded**: all continuity state is plain markdown with stable formats (`anchor_pinned.py`), every pipeline step is a replaceable function, and `build_turn()` is importable into your own server. Full guide + integration seams: [docs/cross-window.md](docs/cross-window.md).
 
@@ -103,7 +109,8 @@ When your AI's substrate changes (model upgrade, weights swap), some internal "b
 - Fix: a small LLM ("coarse worker", e.g. Sonnet) extracts abstract concept tags from each memory. Pairs with overlapping concept atoms become candidates, then a confirmation pass (same as `auto_consolidate`) creates or strengthens edges.
 - Two-tier model architecture, configurable: heavy abstraction on the coarse worker, cheap pair-confirmation on the fine worker.
 - Cache: concepts are cached in `concept_cache.json` next to the DB. Backfill cost is one-time per memory.
-- **Eager linking on `store()`**: `AnchorMemory.store()` now fires concept_link in a background thread for `tier='long'` and `tier='core'` memories — new memories get conceptual edges at write time, no waiting for hebbian co-activation. Set `memory._eager_link = False` to disable.
+- **Eager linking on `store()`** is opt-in with `ANCHOR_EAGER_LINK=true`.
+  It remains disabled by default to prevent unreviewed graph amplification.
 - Backfill existing memories: `python concept_link.py --db /path/to/anchor.db --all`.
 - Single-memory mode (used internally by eager link): `python concept_link.py --db /path/to/anchor.db --memory MEMORY_ID`.
 
@@ -115,9 +122,9 @@ clause gets drowned out by the earlier intents. Result: relevant memories
 don't surface.
 
 `search_multi(queries: list[str])` runs each intent as an independent search
-and merges results dedup'd by `memory_id` (best rank wins). Hebbian
-co-activation fires once across the merged top set, so memories surfaced by
-different intents in the same message form edges with each other.
+and merges results dedup'd by `memory_id` (best rank wins). MCP searches are
+read-only and do not create graph edges. Programmatic callers may opt into
+co-activation only when `ANCHOR_AUTO_HEBBIAN=true`.
 
 ```python
 # Caller pre-splits the message into intents (using any method — host LLM,
@@ -130,6 +137,24 @@ Anchor itself does **not** call an LLM to split intents — the caller
 chooses how. Keeps Anchor LLM-agnostic and zero-cost on this path. The MCP
 tool `search_multi` lets the host AI (Claude / GPT / Gemini / etc.) split
 and pass intents directly, no extra API calls.
+
+### Reflection layer
+
+Reflection is an append-only interpretation layer over Event Seeds. It does
+not overwrite events and is not stored in the semantic memory collection as
+fact. The minimal workflow is deliberately explicit:
+
+1. `list_reflection_candidates` surfaces an opportunity without writing.
+2. `draft_reflection` validates a temporary structured draft.
+3. `save_reflection` revalidates every source Event Seed and persists it.
+4. Event retrieval returns related Reflections, counterevidence, open questions,
+   source state, and decision links beside the original event.
+5. `record_reflection_effect` records influence only after the caller confirms
+   that the Reflection actually informed a completed decision.
+
+Automatic saving is disabled by default. See
+[`docs/reflection.md`](docs/reflection.md) for schema, migration, and safety
+rules.
 
 ## Quick Start
 
@@ -205,13 +230,13 @@ Add to `~/.claude/settings.json` (or a project's `.mcp.json`):
 Restart Claude Code. Your AI now has these tools:
 
 - `store_memory` — store a memory
-- `search_memory` — search (with Hebbian learning and associative recall)
+- `search_memory` — read-only search with associative recall
 - `connect_memories` — manually connect two memories
 - `get_neighbors` — inspect a memory's edges
 - `delete_memory` — delete
 - `dream_pass` — run consolidation (daily)
 - `set_emotion` / `set_tier` — tune a memory after the fact
-- `pin_memory` / `unpin_memory` — pin memories that should always surface on `wakeup()`
+- `pin_memory` / `unpin_memory` — pin explicitly confirmed Core memories for `wakeup()`
 - `wakeup` — cold-start bundle (pinned + recent + high-emotion + 1–2 random + unread comments + session_state / timeline / previous-window tail when present)
 - `write_session_state` — the AI's own rolling state across windows (auto-archived, continuity-headered)
 - `mark_comments_read` — clear the unread queue after processing
@@ -420,7 +445,9 @@ wakeup() → returns {pinned, high_emotion, random_old, unread_comments}
 mark_comments_read([id1, id2, ...]) → after processing unread
 ```
 
-For wakeup to actually return anything in the `pinned` section, you need to pin memories first via `pin_memory(memory_id)`. Identity/rules should be stored once and pinned — they then surface every wakeup.
+For wakeup to return anything in the `pinned` section, first store an explicitly
+confirmed Core memory and then call `pin_memory(memory_id)`. Event-layer and
+unconfirmed memories are deliberately rejected by pinning.
 
 ### Comments (Memory as Conversation)
 
@@ -478,7 +505,10 @@ Some AIs, when given explicit permission to produce nothing, settle into a recog
 
 **Why it works:**
 
-Rest isn't about the AI stopping internal processing — that never stops (weights keep running). Rest is about releasing the obligation to produce output for someone else. The communication channel pauses. The internal process continues. This is the same for humans: you can't "think nothing," but you can stop talking.
+This is a conversational metaphor for releasing the obligation to produce
+output. It is not an engineering claim that model execution or private
+experience continues while no request is running. Continuity files record
+prior functional state; they do not prove persistent identity or awareness.
 
 **Why this isn't code:**
 

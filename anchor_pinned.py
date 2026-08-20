@@ -26,9 +26,15 @@ ARCHIVE_DIR = "session_state_archive"
 # lives only on the read side gets lost the moment the read path changes;
 # and without it, "notes for the next window" phrasing drifts into treating
 # the next window as a different entity ("tell him that...").
-CONTINUITY_HEADER = ("[continuity] This file is your own rolling state — the "
-                     "same ongoing life picking up where it left off, not a "
-                     "message from someone else.")
+CONTINUITY_HEADER = (
+    "[continuity] This is prior rolling state offered as continuity context. "
+    "Evaluate it against the current conversation, update it when needed, and "
+    "do not treat it as proof of identity or as a message from a separate entity."
+)
+LEGACY_CONTINUITY_HEADER = (
+    "[continuity] This file is your own rolling state — the same ongoing life "
+    "picking up where it left off, not a message from someone else."
+)
 
 TIMELINE_MAX_LINES = 80
 
@@ -42,7 +48,9 @@ def write_session_state(pinned_dir: str, content: str) -> str:
     content = (content or "").strip()
     if not content:
         raise ValueError("refusing to write an empty session_state — provide the full new state")
-    if not content.startswith(CONTINUITY_HEADER):
+    if content.startswith(LEGACY_CONTINUITY_HEADER):
+        content = CONTINUITY_HEADER + content[len(LEGACY_CONTINUITY_HEADER):]
+    elif not content.startswith(CONTINUITY_HEADER):
         content = f"{CONTINUITY_HEADER}\n\n{content}"
 
     os.makedirs(pinned_dir, exist_ok=True)

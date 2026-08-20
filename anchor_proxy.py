@@ -25,14 +25,14 @@ remembering to call a tool, and never depends on a window ending gracefully.
         ▼   after every response, background:
         │             5. overwrite last_session.md (mechanical tail — always
         │                fresh no matter how the window dies)
-        │             6. curator: judge-store memories from the exchange +
-        │                append recent_timeline events (needs a configured
-        │                LLM — see anchor_llm.py; silently skipped otherwise)
+        │             6. optional curator: judge-store event candidates +
+        │                append recent_timeline events (requires both a
+        │                configured LLM and ANCHOR_AUTO_CURATE=true)
 
 Zero-LLM floor: steps 1-5 need no LLM beyond your chat model. Steps that do
-(intent-split gate, curator) light up when the user configures one via
-`ANCHOR_LLM` / ~/.anchor/config.yaml — the AI itself can ask its human which
-provider to use and write that config.
+(intent-split gate) light up when the user configures one via `ANCHOR_LLM` /
+~/.anchor/config.yaml. The curator remains disabled until separately opted in
+with `ANCHOR_AUTO_CURATE=true`.
 
 Adapting / extending (the seams are deliberate):
   - File formats & pinned ordering live in anchor_pinned.py — anything that
@@ -346,7 +346,9 @@ CURATOR_SYSTEM = (
     "WHAT happened, WHO, when-context\", "
     "\"context\": \"short verbatim quote of the key lines\", "
     "\"tag\": \"relationship|identity|emotion|learning|history|project|practical\", "
-    "\"tier\": \"long|core|short\", \"emotion\": 0.0-1.0, "
+    "\"tier\": \"long|short\", \"emotion\": 0.0-1.0, "
+    "\"perspective\": \"user|assistant|joint|external|mixed\", "
+    "\"epistemic_status\": \"reported|observed|hypothesis\", "
     "\"timeline_event\": \"one very short event line\"}\n"
     "Do NOT store: pure smalltalk, assistant boilerplate, things obviously "
     "already known. Valid JSON only, no markdown fences."
@@ -358,6 +360,8 @@ def curate_turn(mem, llm, pinned_dir: str, user_text: str, assistant_text: str):
     Runs in a background thread after the response; requires a configured
     LLM (anchor_llm) — without one this is a silent no-op and storing
     remains manual/tool-driven."""
+    if os.getenv("ANCHOR_AUTO_CURATE", "false").lower() != "true":
+        return
     if llm is None or not user_text.strip():
         return
     try:
@@ -373,12 +377,28 @@ def curate_turn(mem, llm, pinned_dir: str, user_text: str, assistant_text: str):
             if not index:
                 continue
             mid = f"mem_{uuid.uuid4().hex[:8]}"
+            perspective = e.get("perspective", "mixed")
+            epistemic_status = e.get("epistemic_status", "reported")
+            if perspective == "assistant":
+                epistemic_status = "hypothesis"
+            if epistemic_status == "confirmed":
+                epistemic_status = "reported"
+            source_ref = f"proxy-curator:{mid}"
             mem.store(memory_id=mid, text=index,
                       tag=e.get("tag", "general"),
-                      tier=e.get("tier", "long"),
+                      tier="short" if e.get("tier") == "short" else "long",
                       emotion_score=float(e.get("emotion", 0.5)),
                       context=(e.get("context") or "").strip(),
-                      source="curator")
+                      source="curator", memory_layer="event",
+                      perspective=perspective,
+                      epistemic_status=epistemic_status,
+                      source_ref=source_ref,
+                      provenance={
+                          "model": getattr(llm, "model", "unknown"),
+                          "thread_id": os.getenv("ANCHOR_THREAD_ID", "proxy"),
+                          "context_ref": source_ref,
+                          "extractor_version": "anchor-proxy-curator-v2",
+                      })
             print(f"[anchor_proxy] curator stored {mid}: {index[:60]}")
             event = (e.get("timeline_event") or "").strip()
             if event:

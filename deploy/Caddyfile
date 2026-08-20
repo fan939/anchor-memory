@@ -1,0 +1,12 @@
+{$ANCHOR_DOMAIN} {
+    encode zstd gzip
+
+    reverse_proxy anchor-memory:8000 {
+        header_up X-Forwarded-Proto https
+    }
+
+    log {
+        output stdout
+        format json
+    }
+}

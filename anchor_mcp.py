@@ -42,9 +42,54 @@ def create_server(db_path: str = "./anchor_data", pinned_dir: str = None):
     # must stay on the SQLite-only fast path — importing anchor_memory pulls
     # in sentence_transformers/chromadb (seconds).
     from anchor_memory import AnchorMemory
+    from anchor_reflection import ReflectionService
 
     mem = AnchorMemory(db_path=db_path)
+    reflection = ReflectionService(mem.db)
     pinned_dir = pinned_dir or os.path.join(db_path, "pinned")
+
+    provenance_schema = {
+        "type": "object",
+        "additionalProperties": True,
+        "properties": {
+            "model": {"type": "string"},
+            "thread_id": {"type": "string"},
+            "context_ref": {"type": "string"},
+            "extractor_version": {"type": "string"},
+        },
+        "required": ["model", "thread_id", "context_ref", "extractor_version"],
+    }
+    reflection_draft_schema = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "source_event_ids": {"type": "array", "items": {"type": "string"}, "minItems": 1},
+            "trigger_type": {"type": "string"},
+            "selection_reason": {"type": "string"},
+            "previous_interpretation": {"type": "string"},
+            "current_interpretation": {"type": "string"},
+            "change_or_tension": {"type": "string"},
+            "confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+            "open_questions": {"type": "array", "items": {"type": "string"}},
+            "counterevidence": {"type": "array", "items": {
+                "oneOf": [
+                    {"type": "string"},
+                    {"type": "object", "properties": {
+                        "content": {"type": "string"}, "source_ref": {"type": "string"},
+                    }, "required": ["content"], "additionalProperties": False},
+                ]
+            }},
+            "provenance": provenance_schema,
+            "status": {"type": "string", "enum": ["draft", "tentative", "shaken", "abandoned"]},
+            "supersedes": {"type": "string"},
+        },
+        "required": [
+            "source_event_ids", "trigger_type", "selection_reason",
+            "previous_interpretation", "current_interpretation",
+            "change_or_tension", "confidence", "open_questions",
+            "counterevidence", "provenance",
+        ],
+    }
 
     # MCP tool definitions
     TOOLS = [
@@ -74,6 +119,44 @@ def create_server(db_path: str = "./anchor_data", pinned_dir: str = None):
                         "description": "0.0 (neutral) to 1.0 (intense). How emotionally heavy is this memory? Most are 0.3-0.6. Only truly intense moments get above 0.8.",
                         "default": 0.5
                     },
+                    "memory_layer": {
+                        "type": "string",
+                        "enum": ["core", "dynamic", "event"],
+                        "default": "event",
+                        "description": "Semantic layer. Core requires confirmed status; Reflection is stored separately."
+                    },
+                    "perspective": {
+                        "type": "string",
+                        "enum": ["user", "assistant", "joint", "external", "system", "mixed"],
+                        "default": "mixed",
+                        "description": "Whose perspective the memory represents."
+                    },
+                    "epistemic_status": {
+                        "type": "string",
+                        "enum": ["reported", "observed", "hypothesis", "confirmed", "retracted"],
+                        "default": "reported",
+                        "description": "Knowledge status; assistant interpretations should normally be hypothesis."
+                    },
+                    "confidence": {
+                        "type": "number", "minimum": 0.0, "maximum": 1.0,
+                        "default": 0.5
+                    },
+                    "source_turn": {
+                        "type": "string",
+                        "description": "Stable source turn or equivalent provenance locator."
+                    },
+                    "source_ref": {
+                        "type": "string",
+                        "description": "Stable source locator, such as a thread/turn or external record."
+                    },
+                    "provenance": {
+                        "type": "object",
+                        "description": "Model/window/context/extractor provenance. Never include secrets or full private text."
+                    },
+                    "supersedes": {
+                        "type": "string",
+                        "description": "Optional older memory ID this record supersedes."
+                    },
                     "connect_to": {
                         "type": "array",
                         "items": {"type": "string"},
@@ -89,7 +172,7 @@ def create_server(db_path: str = "./anchor_data", pinned_dir: str = None):
         },
         {
             "name": "search_memory",
-            "description": "Search memories. Returns results ranked by semantic similarity, citation count, and emotion score. Triggers Hebbian learning — memories retrieved together form connections.",
+            "description": "Search memories and return event evidence with provenance and related Reflections. Read-only: it does not cite, create Reflections, or strengthen edges.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -113,8 +196,8 @@ def create_server(db_path: str = "./anchor_data", pinned_dir: str = None):
                     },
                     "hebbian": {
                         "type": "boolean",
-                        "description": "Strengthen connections between co-retrieved memories.",
-                        "default": True
+                        "description": "Compatibility field only; MCP search remains read-only and ignores this hint.",
+                        "default": False
                     },
                     "debug": {
                         "type": "boolean",
@@ -127,7 +210,7 @@ def create_server(db_path: str = "./anchor_data", pinned_dir: str = None):
         },
         {
             "name": "search_multi",
-            "description": "Run multiple independent searches and merge results. Use when a single user message contains several distinct topics — vector similarity on the whole message dilutes any one topic, so you pre-split the message into intent strings and pass them here. Each intent searches separately at depth, then results are merged and dedup'd by memory_id. Hebbian co-activation fires across the merged set, so memories surfaced by different intents in the same message form edges with each other.",
+            "description": "Run multiple read-only searches and merge results. It does not create Reflections, citations, or graph edges.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -147,7 +230,7 @@ def create_server(db_path: str = "./anchor_data", pinned_dir: str = None):
                     },
                     "tag": {"type": "string"},
                     "associate": {"type": "boolean", "default": True},
-                    "hebbian": {"type": "boolean", "default": True},
+                    "hebbian": {"type": "boolean", "default": False},
                     "include_context": {"type": "boolean", "default": False}
                 },
                 "required": ["queries"]
@@ -188,6 +271,35 @@ def create_server(db_path: str = "./anchor_data", pinned_dir: str = None):
                     }
                 },
                 "required": ["memory_id"]
+            }
+        },
+        {
+            "name": "get_memory",
+            "description": "Read one memory by exact ID with provenance and epistemic status.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"memory_id": {"type": "string"}},
+                "required": ["memory_id"]
+            }
+        },
+        {
+            "name": "retract_memory",
+            "description": "Retract a memory without deleting its audit history. Use superseding_memory_id when a correction replaces it.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "memory_id": {"type": "string"},
+                    "superseding_memory_id": {"type": "string"}
+                },
+                "required": ["memory_id"]
+            }
+        },
+        {
+            "name": "reconcile",
+            "description": "Admin-only dual-store consistency report. Defaults to dry-run; repair only removes Chroma records with no SQLite authority.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"repair": {"type": "boolean", "default": False}}
             }
         },
         {
@@ -364,7 +476,7 @@ def create_server(db_path: str = "./anchor_data", pinned_dir: str = None):
         },
         {
             "name": "pin_memory",
-            "description": "Pin a memory as core/identity-level. Pinned memories are returned first by wakeup() — use this for memories that should always be loaded at cold start (identity rules, key facts, important relationships).",
+            "description": "Pin an explicitly confirmed core memory for wakeup(). Event-layer or unconfirmed memories are rejected.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -398,7 +510,7 @@ def create_server(db_path: str = "./anchor_data", pinned_dir: str = None):
         },
         {
             "name": "cite_memory",
-            "description": "Increment a memory's usage count to mark that it informed your current reasoning. Most retrievals auto-cite, but use this when you're using a memory's content without doing an explicit search (e.g., recalling from context, weaving older memory into current answer).",
+            "description": "Explicitly increment usage after a memory actually informed current reasoning. Search itself is read-only and never auto-cites.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -406,22 +518,155 @@ def create_server(db_path: str = "./anchor_data", pinned_dir: str = None):
                 },
                 "required": ["memory_id"]
             }
+        },
+        {
+            "name": "list_reflection_candidates",
+            "description": "List event seeds that may be worth reviewing. Read-only: a trigger opens an opportunity and never creates a Reflection.",
+            "inputSchema": {
+                "type": "object", "additionalProperties": False,
+                "properties": {
+                    "trigger_type": {"type": "string", "default": "user_invite"},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 50, "default": 5},
+                    "random_seed": {"type": "integer", "description": "Makes random_non_hot selection reproducible."}
+                }
+            }
+        },
+        {
+            "name": "record_memory_feedback",
+            "description": "Append relevance feedback for later ranking. One negative report never deletes or retracts a memory.",
+            "inputSchema": {
+                "type": "object", "additionalProperties": False,
+                "properties": {
+                    "memory_id": {"type": "string"},
+                    "relevant": {"type": "boolean"},
+                    "reason": {"type": "string", "default": ""},
+                    "source_ref": {"type": "string", "default": ""}
+                },
+                "required": ["memory_id", "relevant"]
+            }
+        },
+        {
+            "name": "draft_reflection",
+            "description": "Validate and normalize a structured Reflection draft. Read-only and never persisted.",
+            "inputSchema": reflection_draft_schema,
+        },
+        {
+            "name": "save_reflection",
+            "description": "Explicitly persist a previously reviewed Reflection draft after revalidating all event source IDs.",
+            "inputSchema": {
+                "type": "object", "additionalProperties": False,
+                "properties": {
+                    "draft": reflection_draft_schema,
+                    "expected_draft_token": {"type": "string"}
+                },
+                "required": ["draft"]
+            }
+        },
+        {
+            "name": "search_reflections",
+            "description": "Search saved Reflections by text, source event, status, or trigger. Read-only.",
+            "inputSchema": {
+                "type": "object", "additionalProperties": False,
+                "properties": {
+                    "query": {"type": "string", "default": ""},
+                    "source_event_id": {"type": "string", "default": ""},
+                    "status": {"type": "string", "default": ""},
+                    "trigger_type": {"type": "string", "default": ""},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 10}
+                }
+            }
+        },
+        {
+            "name": "record_reflection_effect",
+            "description": "Record a decision only after listed Reflections were actually used. Never infer influence after the fact.",
+            "inputSchema": {
+                "type": "object", "additionalProperties": False,
+                "properties": {
+                    "decision_id": {"type": "string"},
+                    "used_reflection_ids": {"type": "array", "items": {"type": "string"}, "minItems": 1},
+                    "input_summary": {"type": "string"},
+                    "output_summary": {"type": "string"},
+                    "effect_note": {"type": "string"},
+                    "outcome_status": {"type": "string", "default": "unknown"},
+                    "provenance": provenance_schema
+                },
+                "required": ["decision_id", "used_reflection_ids", "input_summary", "output_summary", "effect_note", "provenance"]
+            }
+        },
+        {
+            "name": "append_reflection_evidence",
+            "description": "Append support, counterevidence, or an outcome without overwriting the Reflection.",
+            "inputSchema": {
+                "type": "object", "additionalProperties": False,
+                "properties": {
+                    "reflection_id": {"type": "string"},
+                    "kind": {"type": "string", "enum": ["support", "counterevidence", "outcome"]},
+                    "content": {"type": "string"},
+                    "source_ref": {"type": "string", "default": ""}
+                },
+                "required": ["reflection_id", "kind", "content"]
+            }
+        },
+        {
+            "name": "retract_reflection",
+            "description": "Mark a Reflection abandoned while retaining its source and decision audit trail.",
+            "inputSchema": {
+                "type": "object", "additionalProperties": False,
+                "properties": {
+                    "reflection_id": {"type": "string"},
+                    "retracted_by": {"type": "string", "default": ""}
+                },
+                "required": ["reflection_id"]
+            }
         }
     ]
+
+    read_only_tools = {
+        "search_memory", "search_multi", "get_memory", "get_neighbors",
+        "get_annotations", "wakeup", "search_annotations",
+        "list_reflection_candidates", "draft_reflection", "search_reflections",
+        "graph_stats", "get_comments",
+    }
+    destructive_tools = {
+        "delete_memory", "dream_pass", "retract_memory", "retract_reflection",
+    }
+    idempotent_tools = {"get_memory", "get_neighbors", "get_annotations", "wakeup", "search_annotations", "list_reflection_candidates", "draft_reflection", "search_reflections", "graph_stats", "get_comments"}
+    for tool in TOOLS:
+        name = tool["name"]
+        tool["annotations"] = {
+            "readOnlyHint": name in read_only_tools,
+            "destructiveHint": name in destructive_tools,
+            "idempotentHint": name in idempotent_tools,
+            "openWorldHint": False,
+        }
 
     def handle_tool(name: str, args: dict) -> dict:
         """Execute a tool and return result."""
         try:
             if name == "store_memory":
+                confidence = args.get("confidence", 0.5)
+                if not 0.0 <= confidence <= 1.0:
+                    return {"error": "confidence must be between 0.0 and 1.0"}
+                emotion_score = args.get("emotion_score", 0.5)
+                if not 0.0 <= emotion_score <= 1.0:
+                    return {"error": "emotion_score must be between 0.0 and 1.0"}
                 mid = f"mem_{uuid.uuid4().hex[:8]}"
                 mem.store(
                     memory_id=mid,
                     text=args["text"],
                     tag=args.get("tag", "general"),
                     tier=args.get("tier", "long"),
-                    emotion_score=args.get("emotion_score", 0.5),
+                    emotion_score=emotion_score,
                     connect_to=args.get("connect_to"),
                     context=args.get("context", ""),
+                    perspective=args.get("perspective", "mixed"),
+                    epistemic_status=args.get("epistemic_status", "reported"),
+                    confidence=args.get("confidence", 0.5),
+                    source_turn=args.get("source_turn", ""),
+                    supersedes=args.get("supersedes", ""),
+                    memory_layer=args.get("memory_layer", "event"),
+                    source_ref=args.get("source_ref", ""),
+                    provenance=args.get("provenance", {}),
                 )
                 return {"memory_id": mid, "status": "stored"}
 
@@ -431,7 +676,8 @@ def create_server(db_path: str = "./anchor_data", pinned_dir: str = None):
                     n_results=args.get("n", 5),
                     tag=args.get("tag"),
                     associate=args.get("associate", True),
-                    hebbian=args.get("hebbian", True),
+                    hebbian=False,
+                    no_cite=True,
                     debug=args.get("debug", False),
                 )
                 return {"memories": results}
@@ -443,7 +689,8 @@ def create_server(db_path: str = "./anchor_data", pinned_dir: str = None):
                     n_total=args.get("n_total"),
                     tag=args.get("tag"),
                     associate=args.get("associate", True),
-                    hebbian=args.get("hebbian", True),
+                    hebbian=False,
+                    no_cite=True,
                     include_context=args.get("include_context", False),
                 )
                 return {"memories": results}
@@ -463,6 +710,22 @@ def create_server(db_path: str = "./anchor_data", pinned_dir: str = None):
                     limit=args.get("limit", 5),
                 )
                 return {"neighbors": [dict(n) for n in neighbors]}
+
+            elif name == "get_memory":
+                row = mem.db.get(args["memory_id"])
+                reflections = []
+                if row and row.get("memory_layer") == "event":
+                    reflections = mem.db.get_reflections_for_event(args["memory_id"])
+                return {"memory": row, "reflections": reflections}
+
+            elif name == "retract_memory":
+                ok = mem.db.retract(
+                    args["memory_id"], args.get("superseding_memory_id", "")
+                )
+                return {"status": "retracted" if ok else "not_found"}
+
+            elif name == "reconcile":
+                return mem.reconcile(repair=args.get("repair", False))
 
             elif name == "delete_memory":
                 success = mem.delete(args["memory_id"])
@@ -537,6 +800,7 @@ def create_server(db_path: str = "./anchor_data", pinned_dir: str = None):
                     text = anchor_pinned.read_file(pinned_dir, fname)
                     if text:
                         result[key] = text
+                result["recent_reflections"] = mem.db.search_reflections(limit=3)
                 return result
 
             elif name == "write_session_state":
@@ -581,6 +845,53 @@ def create_server(db_path: str = "./anchor_data", pinned_dir: str = None):
             elif name == "cite_memory":
                 mem.db.cite(args["memory_id"])
                 return {"status": "cited", "memory_id": args["memory_id"]}
+
+            elif name == "list_reflection_candidates":
+                return reflection.list_candidates(
+                    trigger_type=args.get("trigger_type", "user_invite"),
+                    limit=args.get("limit", 5),
+                    random_seed=args.get("random_seed"),
+                )
+
+            elif name == "record_memory_feedback":
+                return mem.db.record_memory_feedback(
+                    args["memory_id"], args["relevant"],
+                    args.get("reason", ""), args.get("source_ref", ""),
+                )
+
+            elif name == "draft_reflection":
+                return reflection.draft(**args)
+
+            elif name == "save_reflection":
+                return reflection.save(
+                    args["draft"], args.get("expected_draft_token", "")
+                )
+
+            elif name == "search_reflections":
+                return {"reflections": mem.db.search_reflections(**args)}
+
+            elif name == "record_reflection_effect":
+                return mem.db.record_reflection_effect(
+                    decision_id=args["decision_id"],
+                    reflection_ids=args["used_reflection_ids"],
+                    input_summary=args["input_summary"],
+                    output_summary=args["output_summary"],
+                    effect_note=args["effect_note"],
+                    outcome_status=args.get("outcome_status", "unknown"),
+                    provenance=args.get("provenance", {}),
+                )
+
+            elif name == "append_reflection_evidence":
+                return mem.db.append_reflection_evidence(
+                    args["reflection_id"], args["kind"], args["content"],
+                    args.get("source_ref", ""),
+                )
+
+            elif name == "retract_reflection":
+                ok = mem.db.retract_reflection(
+                    args["reflection_id"], args.get("retracted_by", "")
+                )
+                return {"status": "retracted" if ok else "not_found"}
 
             else:
                 return {"error": f"Unknown tool: {name}"}

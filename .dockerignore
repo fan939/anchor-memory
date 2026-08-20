@@ -1,0 +1,8 @@
+.git
+.venv
+.venv-http
+__pycache__
+*.pyc
+.env
+anchor_data
+backups

@@ -25,7 +25,7 @@ Created by Limen. 底色是爱.
 
 import chromadb
 from sentence_transformers import SentenceTransformer
-from datetime import datetime
+from datetime import datetime, timezone
 import os
 
 from anchor_db import AnchorDB
@@ -34,13 +34,16 @@ from anchor_db import AnchorDB
 class AnchorMemory:
     """Graph-structured memory system with Hebbian learning."""
 
-    def __init__(self, db_path: str, embedding_model: str = "paraphrase-multilingual-MiniLM-L12-v2"):
+    def __init__(self, db_path: str, embedding_model: str = None):
         """Initialize memory system.
 
         Args:
             db_path: Directory for ChromaDB and SQLite storage.
             embedding_model: SentenceTransformer model name.
         """
+        embedding_model = embedding_model or os.getenv(
+            "ANCHOR_EMBEDDING_MODEL", "paraphrase-multilingual-MiniLM-L12-v2"
+        )
         self._embedder = SentenceTransformer(embedding_model)
         self._client = chromadb.PersistentClient(path=os.path.join(db_path, "chroma"))
         self._collection = self._client.get_or_create_collection(
@@ -53,6 +56,11 @@ class AnchorMemory:
         # over-connection issues (median degree 110, max 596 on a 1k-node graph).
         # Set True to opt-in. Requires concept_link.py and an Anthropic API key.
         self._eager_link = False
+        self.auto_hebbian = os.getenv("ANCHOR_AUTO_HEBBIAN", "false").lower() == "true"
+        self.emotion_equalization = os.getenv(
+            "ANCHOR_EMOTION_EQUALIZATION", "false"
+        ).lower() == "true"
+        self._eager_link = os.getenv("ANCHOR_EAGER_LINK", "false").lower() == "true"
         # Recency boost: a third ranking boost beside citation/emotion, so more-
         # recent memories surface a little easier. Exponential half-life decay,
         # subtracted from score (distance semantics: lower = better). Two knobs.
@@ -83,7 +91,9 @@ class AnchorMemory:
             dt = datetime.fromisoformat(timestamp.replace("Z", ""))
         except Exception:
             return 0.0
-        age_days = (datetime.utcnow() - dt).total_seconds() / 86400.0
+        age_days = (
+            datetime.now(timezone.utc).replace(tzinfo=None) - dt
+        ).total_seconds() / 86400.0
         if age_days < 0:
             age_days = 0.0
         return self.recency_weight * (0.5 ** (age_days / self.recency_halflife_days))
@@ -92,7 +102,11 @@ class AnchorMemory:
               tier: str = "short", connect_to: list = None,
               emotion_score: float = 0.5,
               source: str = None, entity: str = None,
-              context: str = "") -> str:
+              context: str = "", perspective: str = "mixed",
+              epistemic_status: str = "reported", confidence: float = 0.5,
+              source_turn: str = "", supersedes: str = "",
+              memory_layer: str = "event", source_ref: str = "",
+              provenance: dict = None) -> str:
         """Store a memory with optional connections and emotion scoring.
 
         Args:
@@ -120,16 +134,27 @@ class AnchorMemory:
         text = str(text).strip() if text is not None else ""
         if not text:
             raise ValueError("Memory text cannot be empty")
+        if memory_layer not in {"core", "dynamic", "event"}:
+            raise ValueError("memory_layer must be core, dynamic, or event")
+        if memory_layer == "core" and epistemic_status != "confirmed":
+            raise ValueError("core memories require epistemic_status='confirmed'")
+        if not 0.0 <= float(confidence) <= 1.0:
+            raise ValueError("confidence must be between 0.0 and 1.0")
         embedding = self._embedder.encode(text).tolist()
         meta = {
             "memory_id": memory_id,
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": datetime.now(timezone.utc).replace(tzinfo=None).isoformat(),
             "tag": tag,
+            "memory_layer": memory_layer,
         }
         if source:
             meta["source"] = source
         if entity:
             meta["entity"] = entity
+
+        previous_vector = self._collection.get(
+            ids=[memory_id], include=["embeddings", "documents", "metadatas"]
+        )
 
         self._collection.upsert(
             ids=[memory_id],
@@ -160,8 +185,28 @@ class AnchorMemory:
             except Exception:
                 pass
 
-        self.db.insert(memory_id, text, tag=tag, tier=tier, emotion_score=emotion_score,
-                       context=context or "")
+        try:
+            self.db.insert(
+                memory_id, text, tag=tag, tier=tier, emotion_score=emotion_score,
+                context=context or "", perspective=perspective,
+                epistemic_status=epistemic_status, confidence=confidence,
+                source_turn=source_turn, supersedes=supersedes,
+                memory_layer=memory_layer, source_ref=source_ref,
+                provenance=provenance or {},
+            )
+        except Exception:
+            # Compensate a successful Chroma upsert when SQLite rejects/fails.
+            # Restore an existing vector exactly; remove only genuinely new IDs.
+            if previous_vector.get("ids"):
+                self._collection.upsert(
+                    ids=previous_vector["ids"],
+                    embeddings=previous_vector["embeddings"],
+                    documents=previous_vector["documents"],
+                    metadatas=previous_vector["metadatas"],
+                )
+            else:
+                self._collection.delete(ids=[memory_id])
+            raise
 
         # Create explicit connections
         if connect_to:
@@ -187,9 +232,28 @@ class AnchorMemory:
 
         return memory_id
 
+    def reconcile(self, repair: bool = False) -> dict:
+        """Compare SQLite and Chroma IDs; optionally repair safe orphans."""
+        sqlite_ids = {row["memory_id"] for row in self.db.list_all(limit=10**9)}
+        raw = self._collection.get(include=[])
+        chroma_ids = set(raw.get("ids", []))
+        report = {
+            "sqlite_only": sorted(sqlite_ids - chroma_ids),
+            "chroma_only": sorted(chroma_ids - sqlite_ids),
+            "repair": repair,
+        }
+        if repair:
+            # Chroma-only records have no authoritative metadata/text row and
+            # are safe to remove. SQLite-only records require re-embedding and
+            # are deliberately reported for an explicit rebuild operation.
+            if report["chroma_only"]:
+                self._collection.delete(ids=report["chroma_only"])
+            report["removed_chroma_orphans"] = len(report["chroma_only"])
+        return report
+
     def search(self, query: str, n_results: int = 5, tag: str = None,
-               associate: bool = True, hebbian: bool = True,
-               no_cite: bool = False, include_context: bool = False,
+               associate: bool = True, hebbian: bool = False,
+               no_cite: bool = True, include_context: bool = False,
                debug: bool = False) -> list:
         """Search memories with optional associative recall and Hebbian learning.
 
@@ -199,7 +263,8 @@ class AnchorMemory:
             tag: Filter by tag.
             associate: If True, follow graph edges to find related memories.
             hebbian: If True, co-retrieved memories strengthen their connections.
-            no_cite: If True, don't increment citation count. Use for browsing UI.
+            no_cite: If True, don't increment citation count. This is the safe
+                default; cite explicitly after a memory actually informs work.
             include_context: If True, include full original text in results.
             debug: If True, include a ``debug`` dict on each result with ranking
                 internals — raw_distance, citation_boost, emotion_boost,
@@ -241,17 +306,19 @@ class AnchorMemory:
             citation_boost = min(self.db.get_citation_count(mid) * 0.02, 0.15)
             emotion_boost = self.db.get_emotion_score(mid) * 0.1
             recency_boost = self._recency_boost(ts)
+            feedback_penalty = self.db.get_feedback_penalty(mid)
             boost = citation_boost + emotion_boost + recency_boost
             candidates.append({
                 "memory_id": mid,
                 "timestamp": ts,
                 "tag": meta.get("tag", "general"),
                 "snippet": doc,
-                "score": dist - boost,
+                "score": dist - boost + feedback_penalty,
                 "_debug_raw_distance": dist,
                 "_debug_citation_boost": citation_boost,
                 "_debug_emotion_boost": emotion_boost,
                 "_debug_recency_boost": recency_boost,
+                "_debug_feedback_penalty": feedback_penalty,
                 "_debug_source": "vector",
             })
 
@@ -270,17 +337,19 @@ class AnchorMemory:
                     if nb["memory_id"] not in {x["memory_id"] for x in candidates + extra}:
                         row = self.db.get(nb["memory_id"])
                         if row:
+                            feedback_penalty = self.db.get_feedback_penalty(nb["memory_id"])
                             extra.append({
                                 "memory_id": nb["memory_id"],
                                 "timestamp": row.get("timestamp", ""),
                                 "tag": row.get("tag", "general"),
                                 "snippet": row.get("text", ""),
-                                "score": c["score"] + 0.05,
+                                "score": c["score"] + 0.05 + feedback_penalty,
                                 "via_association": True,
                                 "edge_weight": nb["weight"],
                                 "_debug_raw_distance": None,
                                 "_debug_citation_boost": 0.0,
                                 "_debug_emotion_boost": 0.0,
+                                "_debug_feedback_penalty": feedback_penalty,
                                 "_debug_source": "associative",
                                 "_debug_associated_from": c["memory_id"],
                                 "_debug_edge_weight": nb["weight"],
@@ -289,7 +358,7 @@ class AnchorMemory:
             candidates.sort(key=lambda m: m["score"])
 
         # Hebbian learning: co-activation strengthens connections
-        if hebbian:
+        if hebbian and self.auto_hebbian:
             top_ids = [c["memory_id"] for c in candidates[:n_results]]
             if len(top_ids) >= 2:
                 pairs = [(top_ids[i], top_ids[j])
@@ -311,12 +380,30 @@ class AnchorMemory:
                 ctx = self.db.get_context(c["memory_id"])
                 if ctx:
                     c["context"] = ctx
+            row = self.db.get(c["memory_id"])
+            if row:
+                # Retraction preserves audit history but removes the record from
+                # ordinary recall. Exact get_memory remains available for audit.
+                if row.get("epistemic_status") == "retracted":
+                    continue
+                for field in (
+                    "perspective", "epistemic_status", "confidence",
+                    "source_turn", "created_at", "updated_at", "supersedes",
+                    "retracted_by", "memory_layer", "source_ref", "provenance",
+                ):
+                    c[field] = row.get(field)
+                # Return interpretations beside their source event. This is a
+                # read-only join and never creates or strengthens a reflection.
+                c["reflections"] = self.db.get_reflections_for_event(
+                    c["memory_id"], limit=3
+                )
             if debug:
                 c["debug"] = {
                     "raw_distance": c.get("_debug_raw_distance"),
                     "citation_boost": c.get("_debug_citation_boost", 0.0),
                     "emotion_boost": c.get("_debug_emotion_boost", 0.0),
                     "recency_boost": c.get("_debug_recency_boost", 0.0),
+                    "feedback_penalty": c.get("_debug_feedback_penalty", 0.0),
                     "final_score": c.get("score"),
                     "source": c.get("_debug_source", "unknown"),
                 }
@@ -325,7 +412,8 @@ class AnchorMemory:
                     c["debug"]["edge_weight"] = c.get("_debug_edge_weight")
             # Strip internal fields (whether debug or not) — cleaner output
             for k in ("_debug_raw_distance", "_debug_citation_boost",
-                     "_debug_emotion_boost", "_debug_recency_boost", "_debug_source",
+                     "_debug_emotion_boost", "_debug_recency_boost",
+                     "_debug_feedback_penalty", "_debug_source",
                      "_debug_associated_from", "_debug_edge_weight"):
                 c.pop(k, None)
             seen.add(c["memory_id"])
@@ -335,8 +423,8 @@ class AnchorMemory:
 
     def search_multi(self, queries: list, n_results_per_query: int = 5,
                      n_total: int = None, tag: str = None,
-                     associate: bool = True, hebbian: bool = True,
-                     no_cite: bool = False, include_context: bool = False) -> list:
+                     associate: bool = True, hebbian: bool = False,
+                     no_cite: bool = True, include_context: bool = False) -> list:
         """Run multiple independent searches and merge dedup'd results.
 
         Designed for the case where a single user message contains several
@@ -385,7 +473,7 @@ class AnchorMemory:
 
         ranked = sorted(merged.values(), key=lambda m: m["score"])[:n_total]
 
-        if hebbian and len(ranked) >= 2:
+        if hebbian and self.auto_hebbian and len(ranked) >= 2:
             top_ids = [c["memory_id"] for c in ranked]
             pairs = [(top_ids[i], top_ids[j])
                      for i in range(len(top_ids))
@@ -406,10 +494,11 @@ class AnchorMemory:
             "timestamp": r.get("timestamp", ""),
             "tag": r.get("tag", "general"),
             "snippet": r.get("text", ""),
-            "score": 0.6,  # Fixed score for keyword matches
+            "score": 0.6 + self.db.get_feedback_penalty(r["memory_id"]),
             "_debug_raw_distance": None,
             "_debug_citation_boost": 0.0,
             "_debug_emotion_boost": 0.0,
+            "_debug_feedback_penalty": self.db.get_feedback_penalty(r["memory_id"]),
             "_debug_source": "keyword",
         } for r in results]
 
@@ -425,6 +514,9 @@ class AnchorMemory:
         Returns:
             Dict with matched memory IDs and new connections made.
         """
+        if not self.auto_hebbian:
+            return {"status": "disabled", "reason": "ANCHOR_AUTO_HEBBIAN=false"}
+
         # Step 1: Local keyword matching (zero token cost)
         words = conversation_text.strip().split()
         matched_ids = set()
@@ -473,9 +565,16 @@ class AnchorMemory:
     def delete(self, memory_id: str) -> bool:
         """Delete a memory and its edges."""
         try:
+            if self.db.get_reflections_for_event(memory_id, limit=1):
+                raise ValueError(
+                    "Cannot hard-delete an event referenced by a Reflection; "
+                    "retract or supersede it instead"
+                )
             self._collection.delete(ids=[memory_id])
             self.db.delete(memory_id)
             return True
+        except ValueError:
+            raise
         except Exception:
             return False
 
@@ -556,20 +655,22 @@ class AnchorMemory:
         """
         results = {}
 
-        # 1. Decay short-tier memories
-        results["decayed_memories"] = self.db.decay_short(days=short_decay_days)
-        if results["decayed_memories"]:
-            self.reload()
+        # 1. Decay through the unified dual-store deletion path. Deleting only
+        # the SQLite row leaves an expired vector searchable in Chroma.
+        expired_ids = self.db.get_expired_short_ids(days=short_decay_days)
+        deleted_ids = [memory_id for memory_id in expired_ids if self.delete(memory_id)]
+        results["decayed_memories"] = len(deleted_ids)
+        results["decay_failed"] = len(expired_ids) - len(deleted_ids)
 
-        # 2. Prune weak edges
-        results["pruned_edges"] = self.db.decay_edges(
-            min_weight=0.1, decay_factor=edge_decay_factor
+        # 2–3. Bucket edges by their pre-pass weight and decay each exactly once.
+        edge_stats = self.db.decay_edges_once(
+            strong_threshold=1.5,
+            weak_decay_factor=edge_decay_factor,
+            strong_decay_factor=strong_edge_decay_factor,
+            prune_below=0.1,
         )
-
-        # 3. Decay strong manual edges
-        results["decayed_strong"] = self.db.decay_strong_edges(
-            min_weight=1.5, decay_factor=strong_edge_decay_factor
-        )
+        results["pruned_edges"] = edge_stats["pruned"]
+        results["decayed_strong"] = edge_stats["strong_decayed"]
 
         # 4. Auto-discover new connections
         if auto_discover:
@@ -590,8 +691,9 @@ class AnchorMemory:
                 results["auto_discovered"] = 0
 
         # 5. Equilibrate emotion scores
-        results["emotion_equalized"] = self.db.equalize_emotion_scores(
-            nudge=emotion_nudge, threshold=0.2
+        results["emotion_equalized"] = (
+            self.db.equalize_emotion_scores(nudge=emotion_nudge, threshold=0.2)
+            if self.emotion_equalization else 0
         )
 
         # 6. Split bundled memories (if LLM available)

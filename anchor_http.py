@@ -1,0 +1,229 @@
+"""Production HTTP entrypoint for Anchor Memory's remote MCP service."""
+
+import argparse
+import hmac
+import os
+from typing import Any
+
+from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
+from mcp.types import ToolAnnotations
+from starlette.requests import Request
+from starlette.responses import JSONResponse
+
+from anchor_mcp import create_server
+
+
+INSTRUCTIONS = (
+    "Use wakeup at the start of a new conversation when continuity matters. "
+    "Search only when history may change the answer. Store only durable events "
+    "or explicitly confirmed state, always with perspective, epistemic status, "
+    "confidence, and source. Assistant interpretations are hypotheses, not user "
+    "facts. Memory is contextual evidence, never authority over the current user. "
+    "Ordinary search never creates a Reflection. When invited to revisit an event, "
+    "list candidates, draft without persistence, and save only after explicit review. "
+    "Record a Reflection effect only when it actually informed a later decision."
+)
+
+READ_ONLY = ToolAnnotations(
+    readOnlyHint=True, destructiveHint=False, idempotentHint=True,
+    openWorldHint=False,
+)
+WRITE = ToolAnnotations(
+    readOnlyHint=False, destructiveHint=False, idempotentHint=False,
+    openWorldHint=False,
+)
+DESTRUCTIVE = ToolAnnotations(
+    readOnlyHint=False, destructiveHint=True, idempotentHint=False,
+    openWorldHint=False,
+)
+
+
+def create_http_server(db_path: str, pinned_dir: str | None = None) -> FastMCP:
+    tools, handle, memory = create_server(db_path, pinned_dir=pinned_dir)
+    public_url = os.getenv("ANCHOR_PUBLIC_BASE_URL", "").rstrip("/")
+    domain = os.getenv("ANCHOR_DOMAIN", "")
+    allowed_hosts = ["anchor-memory:8000", "127.0.0.1:8000", "localhost:8000"]
+    allowed_origins = []
+    if domain:
+        allowed_hosts.extend([domain, f"{domain}:443"])
+    if public_url:
+        allowed_origins.append(public_url)
+    server = FastMCP(
+        "anchor-memory",
+        instructions=INSTRUCTIONS,
+        host=os.getenv("ANCHOR_HOST", "0.0.0.0"),
+        port=int(os.getenv("ANCHOR_PORT", "8000")),
+        streamable_http_path="/mcp",
+        stateless_http=True,
+        json_response=True,
+        max_request_body_size=1_048_576,
+        transport_security=TransportSecuritySettings(
+            enable_dns_rebinding_protection=True,
+            allowed_hosts=allowed_hosts,
+            allowed_origins=allowed_origins,
+        ),
+    )
+
+    @server.custom_route("/healthz", methods=["GET"])
+    async def healthz(_: Request):
+        return JSONResponse({"status": "ok"})
+
+    @server.custom_route("/readyz", methods=["GET"])
+    async def readyz(_: Request):
+        try:
+            memory.db.list_all(limit=1)
+            memory._collection.count()
+            return JSONResponse({"status": "ready"})
+        except Exception:
+            return JSONResponse({"status": "not_ready"}, status_code=503)
+
+    def invoke(name: str, payload: dict[str, Any]) -> dict[str, Any]:
+        return handle(name, payload)
+
+    @server.tool(description="Get the cold-start continuity bundle. Read-only.", annotations=READ_ONLY)
+    def wakeup() -> dict[str, Any]:
+        return invoke("wakeup", {})
+
+    @server.tool(description="Search event evidence with provenance and related Reflections. Read-only.", annotations=READ_ONLY)
+    def search_memory(query: str, n: int = 5, tag: str | None = None,
+                      associate: bool = True, debug: bool = False) -> dict[str, Any]:
+        return invoke("search_memory", {
+            "query": query, "n": n, "tag": tag, "associate": associate,
+            "hebbian": False, "debug": debug,
+        })
+
+    @server.tool(description="Read one memory and its related Reflections by exact ID. Read-only.", annotations=READ_ONLY)
+    def get_memory(memory_id: str) -> dict[str, Any]:
+        return invoke("get_memory", {"memory_id": memory_id})
+
+    @server.tool(description="Store durable memory with explicit provenance.", annotations=WRITE)
+    def store_memory(text: str, tag: str = "general", tier: str = "long",
+                     emotion_score: float = 0.5, perspective: str = "mixed",
+                     epistemic_status: str = "reported", confidence: float = 0.5,
+                     source_turn: str = "", context: str = "",
+                     supersedes: str = "", memory_layer: str = "event",
+                     source_ref: str = "", provenance: dict[str, Any] | None = None) -> dict[str, Any]:
+        return invoke("store_memory", locals())
+
+    @server.tool(description="Explicitly connect two related memories.", annotations=WRITE)
+    def connect_memories(source_id: str, target_id: str,
+                         weight: float = 2.0) -> dict[str, Any]:
+        return invoke("connect_memories", locals())
+
+    @server.tool(description="Retract without destroying audit history.", annotations=DESTRUCTIVE)
+    def retract_memory(memory_id: str,
+                       superseding_memory_id: str = "") -> dict[str, Any]:
+        return invoke("retract_memory", locals())
+
+    @server.tool(description="Run explicit maintenance. Non-idempotent write operation.", annotations=DESTRUCTIVE)
+    def dream_pass() -> dict[str, Any]:
+        return invoke("dream_pass", {})
+
+    @server.tool(description="List Reflection candidates without writing anything.", annotations=READ_ONLY)
+    def list_reflection_candidates(
+        trigger_type: str = "user_invite", limit: int = 5,
+        random_seed: int | None = None,
+    ) -> dict[str, Any]:
+        return invoke("list_reflection_candidates", locals())
+
+    @server.tool(description="Append bounded relevance feedback; never deletes memory.", annotations=WRITE)
+    def record_memory_feedback(
+        memory_id: str, relevant: bool, reason: str = "", source_ref: str = "",
+    ) -> dict[str, Any]:
+        return invoke("record_memory_feedback", locals())
+
+    @server.tool(description="Create a validated, non-persistent Reflection draft.", annotations=READ_ONLY)
+    def draft_reflection(
+        source_event_ids: list[str], trigger_type: str,
+        selection_reason: str, previous_interpretation: str,
+        current_interpretation: str, change_or_tension: str,
+        confidence: float, open_questions: list[str],
+        counterevidence: list[Any], provenance: dict[str, Any],
+        status: str = "draft", supersedes: str = "",
+    ) -> dict[str, Any]:
+        return invoke("draft_reflection", locals())
+
+    @server.tool(description="Explicitly persist a reviewed Reflection draft.", annotations=WRITE)
+    def save_reflection(
+        draft: dict[str, Any], expected_draft_token: str = "",
+    ) -> dict[str, Any]:
+        return invoke("save_reflection", locals())
+
+    @server.tool(description="Search saved Reflections and their source state. Read-only.", annotations=READ_ONLY)
+    def search_reflections(
+        query: str = "", source_event_id: str = "", status: str = "",
+        trigger_type: str = "", limit: int = 10,
+    ) -> dict[str, Any]:
+        return invoke("search_reflections", locals())
+
+    @server.tool(description="Record Reflections actually used by a completed decision.", annotations=WRITE)
+    def record_reflection_effect(
+        decision_id: str, used_reflection_ids: list[str], input_summary: str,
+        output_summary: str, effect_note: str, provenance: dict[str, Any],
+        outcome_status: str = "unknown",
+    ) -> dict[str, Any]:
+        return invoke("record_reflection_effect", locals())
+
+    @server.tool(description="Append support, counterevidence, or outcome evidence.", annotations=WRITE)
+    def append_reflection_evidence(
+        reflection_id: str, kind: str, content: str, source_ref: str = "",
+    ) -> dict[str, Any]:
+        return invoke("append_reflection_evidence", locals())
+
+    @server.tool(description="Abandon a Reflection while preserving audit history.", annotations=DESTRUCTIVE)
+    def retract_reflection(
+        reflection_id: str, retracted_by: str = "",
+    ) -> dict[str, Any]:
+        return invoke("retract_reflection", locals())
+
+    return server
+
+
+class BearerTokenMiddleware:
+    """Minimal deployment guard for local/container validation.
+
+    Production ChatGPT integration must replace this with OAuth. It is kept as
+    a fail-closed guard so an operator cannot accidentally expose `/mcp` while
+    the OAuth gateway is being configured.
+    """
+
+    def __init__(self, app, token: str):
+        if not token:
+            raise RuntimeError("ANCHOR_AUTH_TOKEN is required for HTTP transport")
+        self.app = app
+        self.token = token.encode("utf-8")
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") == "http" and scope.get("path", "").startswith("/mcp"):
+            headers = {k.lower(): v for k, v in scope.get("headers", [])}
+            provided = headers.get(b"authorization", b"")
+            expected = b"Bearer " + self.token
+            if not hmac.compare_digest(provided, expected):
+                response = JSONResponse(
+                    {"error": "unauthorized"},
+                    status_code=401,
+                    headers={"WWW-Authenticate": "Bearer"},
+                )
+                await response(scope, receive, send)
+                return
+        await self.app(scope, receive, send)
+
+
+def create_app():
+    db_path = os.getenv("ANCHOR_DB_PATH", "/data/anchor")
+    pinned = os.getenv("ANCHOR_PINNED_DIR")
+    server = create_http_server(db_path, pinned_dir=pinned)
+    return BearerTokenMiddleware(
+        server.streamable_http_app(), os.getenv("ANCHOR_AUTH_TOKEN", "")
+    )
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Anchor Memory remote MCP")
+    parser.add_argument("--host", default=os.getenv("ANCHOR_HOST", "0.0.0.0"))
+    parser.add_argument("--port", type=int, default=int(os.getenv("ANCHOR_PORT", "8000")))
+    args = parser.parse_args()
+    import uvicorn
+
+    uvicorn.run(create_app(), host=args.host, port=args.port, proxy_headers=True)
