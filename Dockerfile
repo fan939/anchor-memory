@@ -14,7 +14,8 @@ RUN groupadd --system anchor && useradd --system --gid anchor --home /app anchor
 WORKDIR /app
 
 COPY requirements.txt ./
-RUN pip install --index-url "${PYTORCH_INDEX_URL}" torch && \
+RUN pip install --index-url "${PIP_INDEX_URL}" \
+        --extra-index-url "${PYTORCH_INDEX_URL}" torch && \
     pip install --index-url "${PIP_INDEX_URL}" --requirement requirements.txt
 
 COPY . ./
