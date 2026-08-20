@@ -7,5 +7,6 @@ sentence-transformers>=2.2.0
 # Install if your memories or queries contain Chinese.
 jieba>=0.42
 mcp>=1.20,<2
+PyJWT[crypto]>=2.8,<3
 uvicorn>=0.31,<1
 tzdata>=2024.1

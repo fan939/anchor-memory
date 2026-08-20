@@ -65,3 +65,9 @@ https://developers.openai.com/plugins/build/auth
 
 Static `ANCHOR_AUTH_TOKEN` remains a staging fail-closed guard only. ICP filing
 and TLS readiness alone are not authorization to publish the staging container.
+
+For Auth0-backed production access, set `ANCHOR_AUTH_MODE=oauth`, configure the
+exact HTTPS issuer in `ANCHOR_OAUTH_ISSUER`, and set `ANCHOR_OAUTH_RESOURCE` to
+the API identifier ending in `/mcp`. The server then publishes protected-resource
+metadata at `/.well-known/oauth-protected-resource/mcp` and validates RS256
+signatures, issuer, audience, expiry, subject, and the required Anchor scopes.

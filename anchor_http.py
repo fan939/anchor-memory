@@ -6,11 +6,14 @@ import os
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
+from mcp.server.auth.settings import AuthSettings
 from mcp.server.transport_security import TransportSecuritySettings
 from mcp.types import ToolAnnotations
+from pydantic import AnyHttpUrl
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
+from anchor_auth import Auth0JWTVerifier, OAUTH_SCOPES
 from anchor_mcp import create_server
 
 
@@ -49,6 +52,28 @@ def create_http_server(db_path: str, pinned_dir: str | None = None) -> FastMCP:
         allowed_hosts.extend([domain, f"{domain}:443"])
     if public_url:
         allowed_origins.append(public_url)
+    auth_mode = os.getenv("ANCHOR_AUTH_MODE", "static").strip().lower()
+    auth_options: dict[str, Any] = {}
+    if auth_mode == "oauth":
+        issuer = os.getenv("ANCHOR_OAUTH_ISSUER", "").strip().rstrip("/") + "/"
+        resource = os.getenv("ANCHOR_OAUTH_RESOURCE", "").strip()
+        if not resource and public_url:
+            resource = f"{public_url}/mcp"
+        if not issuer.startswith("https://") or not resource.startswith("https://"):
+            raise RuntimeError(
+                "OAuth mode requires HTTPS ANCHOR_OAUTH_ISSUER and ANCHOR_OAUTH_RESOURCE"
+            )
+        auth_options = {
+            "token_verifier": Auth0JWTVerifier(issuer=issuer, audience=resource),
+            "auth": AuthSettings(
+                issuer_url=AnyHttpUrl(issuer),
+                resource_server_url=AnyHttpUrl(resource),
+                required_scopes=list(OAUTH_SCOPES),
+            ),
+        }
+    elif auth_mode != "static":
+        raise RuntimeError("ANCHOR_AUTH_MODE must be either 'static' or 'oauth'")
+
     server = FastMCP(
         "anchor-memory",
         instructions=INSTRUCTIONS,
@@ -63,6 +88,7 @@ def create_http_server(db_path: str, pinned_dir: str | None = None) -> FastMCP:
             allowed_hosts=allowed_hosts,
             allowed_origins=allowed_origins,
         ),
+        **auth_options,
     )
 
     @server.custom_route("/healthz", methods=["GET"])
@@ -214,6 +240,8 @@ def create_app():
     db_path = os.getenv("ANCHOR_DB_PATH", "/data/anchor")
     pinned = os.getenv("ANCHOR_PINNED_DIR")
     server = create_http_server(db_path, pinned_dir=pinned)
+    if os.getenv("ANCHOR_AUTH_MODE", "static").strip().lower() == "oauth":
+        return server.streamable_http_app()
     return BearerTokenMiddleware(
         server.streamable_http_app(), os.getenv("ANCHOR_AUTH_TOKEN", "")
     )
