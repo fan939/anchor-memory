@@ -608,6 +608,12 @@ class AnchorDB:
             default_salience_count = conn.execute(
                 "SELECT COUNT(*) AS n FROM memories m WHERE " + visible + " AND salience = 0.5"
             ).fetchone()["n"]
+            salience_seed_rows = conn.execute(
+                "SELECT memory_id, salience, memory_layer, pinned FROM memories m "
+                "WHERE " + visible + " AND salience = 0.5 "
+                "AND (memory_layer = 'core' OR pinned = 1) "
+                "ORDER BY pinned DESC, memory_layer DESC, timestamp DESC"
+            ).fetchall()
             abandoned_count = conn.execute(
                 "SELECT COUNT(*) AS n FROM reflections WHERE status = 'abandoned'"
             ).fetchone()["n"]
@@ -663,6 +669,30 @@ class AnchorDB:
                     ),
                     "manual_review_required": True,
                 })
+
+        # Deterministic signals can produce review candidates, never automatic
+        # salience writes. Merge by memory ID and keep the strongest suggestion.
+        for row in salience_seed_rows:
+            item = dict(row)
+            suggested = 0.90 if item["pinned"] else 0.80
+            reason = (
+                "explicitly pinned for recall priority" if item["pinned"]
+                else "confirmed Core memory belongs to the stable identity layer"
+            )
+            salience_review.append({
+                "memory_id": item["memory_id"],
+                "current_salience": float(item["salience"]),
+                "suggested_salience": suggested,
+                "reason": reason,
+                "manual_review_required": True,
+            })
+
+        merged_salience = {}
+        for item in salience_review:
+            current = merged_salience.get(item["memory_id"])
+            if current is None or item["suggested_salience"] > current["suggested_salience"]:
+                merged_salience[item["memory_id"]] = item
+        salience_review = list(merged_salience.values())
 
         markers = ("未解决", "尚未解决", "没有答案", "尚无答案", "待确认", "待回答",
                    "unresolved", "open question")
@@ -975,6 +1005,53 @@ class AnchorDB:
                 params + [max(1, min(limit, 100))],
             ).fetchall()
         return [self.get_reflection(row["reflection_id"]) for row in rows]
+
+    def wakeup_reflections(self, limit: int = 2,
+                           include_drafts: bool = False) -> dict:
+        """Return a compact, policy-explicit Reflection cold-start block."""
+        limit = max(0, min(int(limit), 20))
+        with self._conn() as conn:
+            excluded_drafts = conn.execute(
+                "SELECT COUNT(*) AS n FROM reflections WHERE status = 'draft'"
+            ).fetchone()["n"]
+            if limit:
+                draft_clause = "" if include_drafts else " AND status != 'draft'"
+                rows = conn.execute(
+                    "SELECT reflection_id FROM reflections "
+                    "WHERE status != 'abandoned'" + draft_clause +
+                    " ORDER BY created_at DESC LIMIT ?",
+                    (limit,),
+                ).fetchall()
+            else:
+                rows = []
+
+        items = []
+        for row in rows:
+            reflection = self.get_reflection(row["reflection_id"])
+            items.append({
+                "reflection_id": reflection["reflection_id"],
+                "created_at": reflection["created_at"],
+                "updated_at": reflection["updated_at"],
+                "trigger_type": reflection["trigger_type"],
+                "current_interpretation": reflection["current_interpretation"],
+                "change_or_tension": reflection["change_or_tension"],
+                "confidence": reflection["confidence"],
+                "open_questions": reflection["open_questions"],
+                "status": reflection["status"],
+                "source_event_ids": reflection["source_event_ids"],
+                "source_integrity": reflection["source_integrity"],
+                "counterevidence_count": len(reflection["counterevidence"]),
+                "affected_decision_ids": reflection["affected_decision_ids"],
+            })
+        return {
+            "items": items,
+            "policy": {
+                "include_drafts": bool(include_drafts),
+                "excluded_draft_count": 0 if include_drafts else int(excluded_drafts or 0),
+                "abandoned_always_excluded": True,
+                "detail_level": "compact",
+            },
+        }
 
     def list_reflection_candidate_rows(self, limit: int = 50) -> list:
         with self._conn() as conn:
@@ -1676,7 +1753,7 @@ class AnchorDB:
     def wakeup(self, n_high_emotion: int = 5, n_random: int = 2,
                high_emotion_days: int = 3, n_recent: int = 5,
                n_salient: int = 3, n_unresolved: int = 3,
-               debug: bool = False) -> dict:
+               n_identity: int = 5, debug: bool = False) -> dict:
         """Gather everything needed for cold start in one call.
 
         Returns pinned + recent + recent high-emotion + random old + unread comments.
@@ -1700,48 +1777,90 @@ class AnchorDB:
 
         visible = "epistemic_status != 'retracted' AND state != 'superseded'"
         with self._conn() as conn:
+            selected_ids = []
+
+            def exclusion():
+                if not selected_ids:
+                    return "", []
+                return (
+                    " AND memory_id NOT IN (%s)" % ",".join("?" * len(selected_ids)),
+                    list(selected_ids),
+                )
+
+            # Identity is a stable axis, not a side effect of recency. Confirmed
+            # Core memories own this section and are removed from later buckets.
+            identity = conn.execute(
+                "SELECT memory_id, text, tag, emotion_score, timestamp, context, "
+                "salience, motifs, state, unresolved, open_questions, memory_layer, "
+                "epistemic_status FROM memories WHERE memory_layer = 'core' "
+                f"AND epistemic_status = 'confirmed' AND {visible} "
+                "ORDER BY pinned DESC, salience DESC, updated_at DESC LIMIT ?",
+                (n_identity,),
+            ).fetchall() if n_identity > 0 else []
+            selected_ids.extend(row["memory_id"] for row in identity)
+
+            exclude, excluded = exclusion()
             pinned = conn.execute(
                 "SELECT memory_id, text, tag, emotion_score, context FROM memories "
-                f"WHERE pinned = 1 AND {visible} ORDER BY timestamp"
+                f"WHERE pinned = 1 AND {visible}{exclude} ORDER BY timestamp",
+                excluded,
             ).fetchall()
+            selected_ids.extend(row["memory_id"] for row in pinned)
 
+            exclude, excluded = exclusion()
+            unresolved_rows = conn.execute(
+                "SELECT memory_id, text, tag, timestamp, salience, motifs, state, "
+                "unresolved, open_questions FROM memories "
+                f"WHERE unresolved = 1 AND {visible}{exclude} "
+                "ORDER BY salience DESC, timestamp DESC LIMIT ?",
+                excluded + [n_unresolved],
+            ).fetchall() if n_unresolved > 0 else []
+            selected_ids.extend(row["memory_id"] for row in unresolved_rows)
+
+            # 0.5 is the legacy/unreviewed default. Treating it as "salient"
+            # merely creates a second recent bucket, so only differentiated
+            # values above the neutral default qualify here.
+            exclude, excluded = exclusion()
+            salient = conn.execute(
+                "SELECT memory_id, text, tag, emotion_score, timestamp, context, "
+                "salience, motifs, state, unresolved, open_questions FROM memories "
+                f"WHERE salience > 0.5 AND {visible}{exclude} "
+                "ORDER BY salience DESC, timestamp DESC LIMIT ?",
+                excluded + [n_salient],
+            ).fetchall() if n_salient > 0 else []
+            selected_ids.extend(row["memory_id"] for row in salient)
+
+            exclude, excluded = exclusion()
             recent = conn.execute(
                 "SELECT memory_id, text, tag, emotion_score, timestamp, context FROM memories "
-                f"WHERE pinned = 0 AND {visible} ORDER BY timestamp DESC LIMIT ?",
-                (n_recent,),
+                f"WHERE pinned = 0 AND {visible}{exclude} ORDER BY timestamp DESC LIMIT ?",
+                excluded + [n_recent],
             ).fetchall() if n_recent > 0 else []
-            recent_ids = [r["memory_id"] for r in recent]
+            selected_ids.extend(row["memory_id"] for row in recent)
 
-            exclude = " AND memory_id NOT IN (%s)" % ",".join("?" * len(recent_ids)) \
-                if recent_ids else ""
+            exclude, excluded = exclusion()
             high_emotion = conn.execute(
                 f"SELECT memory_id, text, tag, emotion_score, timestamp, context FROM memories "
                 f"WHERE timestamp >= ? AND pinned = 0 AND {visible}{exclude} "
                 f"ORDER BY emotion_score DESC LIMIT ?",
-                [cutoff] + recent_ids + [n_high_emotion],
-            ).fetchall()
+                [cutoff] + excluded + [n_high_emotion],
+            ).fetchall() if n_high_emotion > 0 else []
+            selected_ids.extend(row["memory_id"] for row in high_emotion)
 
+            exclude, excluded = exclusion()
             random_old = conn.execute(
                 "SELECT memory_id, text, tag, emotion_score, timestamp, context FROM memories "
-                f"WHERE timestamp < ? AND pinned = 0 AND {visible} "
+                f"WHERE timestamp < ? AND pinned = 0 AND {visible}{exclude} "
                 "ORDER BY RANDOM() LIMIT ?",
-                (cutoff, n_random),
-            ).fetchall()
+                [cutoff] + excluded + [n_random],
+            ).fetchall() if n_random > 0 else []
 
-            salient = conn.execute(
-                "SELECT memory_id, text, tag, emotion_score, timestamp, context, "
-                "salience, motifs, state, unresolved, open_questions FROM memories "
-                f"WHERE {visible} ORDER BY salience DESC, timestamp DESC LIMIT ?",
-                (n_salient,),
-            ).fetchall() if n_salient > 0 else []
-
-            unresolved_rows = conn.execute(
-                "SELECT memory_id, text, tag, timestamp, salience, motifs, state, "
-                "unresolved, open_questions FROM memories "
-                f"WHERE unresolved = 1 AND {visible} "
-                "ORDER BY salience DESC, timestamp DESC LIMIT ?",
-                (n_unresolved,),
-            ).fetchall() if n_unresolved > 0 else []
+            salience_counts = conn.execute(
+                "SELECT COUNT(*) AS visible_count, "
+                "SUM(CASE WHEN salience = 0.5 THEN 1 ELSE 0 END) AS default_count, "
+                "SUM(CASE WHEN salience > 0.5 THEN 1 ELSE 0 END) AS high_count "
+                f"FROM memories WHERE {visible}"
+            ).fetchone()
 
             unread = conn.execute(
                 "SELECT c.comment_id, c.memory_id, c.content, c.author, c.created_at, "
@@ -1781,16 +1900,27 @@ class AnchorDB:
                 output.append(item)
             return output
 
+        identity_items = decode(identity)
         salient_items = decode(salient)
         unresolved_items = decode(unresolved_rows)
         hints = []
         for item in salient_items:
             hints.extend(item.get("motifs", []))
         for item in unresolved_items:
+            hints.extend(item.get("motifs", []))
             hints.extend(item.get("open_questions", []))
         recall_hints = list(dict.fromkeys(hint for hint in hints if hint))[:3]
 
         result = {
+            "cold_start_contract": {
+                "version": "1.0",
+                "identity_snapshot": [item["memory_id"] for item in identity_items],
+                "active_state": [item["memory_id"] for item in unresolved_items],
+                "key_history": [item["memory_id"] for item in decode(pinned) + salient_items + decode(high_emotion)],
+                "change_log": [item["memory_id"] for item in decode(recent)],
+                "deduplicated": True,
+            },
+            "identity_snapshot": identity_items,
             "pinned": [dict(r) for r in pinned],
             "recent": [dict(r) for r in recent],
             "high_emotion": [dict(r) for r in high_emotion],
@@ -1799,6 +1929,12 @@ class AnchorDB:
             "unresolved": unresolved_items,
             "recall_hints": recall_hints,
             "unread_comments": [dict(r) for r in unread],
+            "salience_status": {
+                "visible_memories": int(salience_counts["visible_count"] or 0),
+                "default_value_memories": int(salience_counts["default_count"] or 0),
+                "high_salience_memories": int(salience_counts["high_count"] or 0),
+                "policy": "salient requires an explicit value above the neutral 0.5 default",
+            },
         }
         if debug:
             result["audit"] = audit

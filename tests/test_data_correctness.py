@@ -172,7 +172,7 @@ class DataCorrectnessTests(unittest.TestCase):
         normal = self.db.wakeup(n_random=0, debug=False)
         audit = self.db.wakeup(n_random=0, debug=True)
         normal_ids = {
-            item["memory_id"] for key in ("pinned", "recent", "high_emotion", "salient", "unresolved")
+            item["memory_id"] for key in ("identity_snapshot", "pinned", "recent", "high_emotion", "salient", "unresolved")
             for item in normal[key]
         }
 
@@ -181,9 +181,62 @@ class DataCorrectnessTests(unittest.TestCase):
         self.assertNotIn("audit", normal)
         self.assertIn("gone", {item["memory_id"] for item in audit["audit"]["filtered_memories"]})
 
+    def test_wakeup_has_stable_identity_dedupes_and_rejects_default_salience(self):
+        self.db.insert(
+            "identity", "Confirmed identity", memory_layer="core",
+            epistemic_status="confirmed", salience=0.5,
+        )
+        self.db.insert("default", "Neutral default", salience=0.5)
+        self.db.insert("important", "Reviewed important", salience=0.8)
+        self.db.insert(
+            "question", "Explicit question", salience=0.7,
+            open_questions=["What changes next?"],
+        )
+
+        result = self.db.wakeup(n_random=0, n_identity=5)
+        buckets = [
+            result[key] for key in (
+                "identity_snapshot", "pinned", "unresolved", "salient",
+                "recent", "high_emotion", "random_old",
+            )
+        ]
+        ids = [item["memory_id"] for bucket in buckets for item in bucket]
+
+        self.assertEqual(len(ids), len(set(ids)))
+        self.assertEqual(["identity"], [item["memory_id"] for item in result["identity_snapshot"]])
+        self.assertNotIn("default", {item["memory_id"] for item in result["salient"]})
+        self.assertEqual(2, result["salience_status"]["default_value_memories"])
+        self.assertTrue(result["cold_start_contract"]["deduplicated"])
+
+    def test_wakeup_reflections_excludes_drafts_by_default_and_is_compact(self):
+        self.db.insert("source", "event source", memory_layer="event")
+        common = {
+            "source_event_ids": ["source"], "trigger_type": "unresolved",
+            "selection_reason": "fixture", "previous_interpretation": "old",
+            "current_interpretation": "new", "change_or_tension": "changed",
+            "confidence": 0.7, "open_questions": ["Still open?"],
+            "counterevidence": [{"content": "one counterexample"}],
+            "provenance": {"fixture": "test"},
+        }
+        self.db.create_reflection(reflection_id="draft-reflection", status="draft", **common)
+        self.db.create_reflection(reflection_id="tentative-reflection", status="tentative", **common)
+
+        normal = self.db.wakeup_reflections(limit=5)
+        audit = self.db.wakeup_reflections(limit=5, include_drafts=True)
+
+        self.assertEqual(["tentative-reflection"], [item["reflection_id"] for item in normal["items"]])
+        self.assertEqual(1, normal["policy"]["excluded_draft_count"])
+        self.assertEqual(2, len(audit["items"]))
+        self.assertNotIn("sources", normal["items"][0])
+        self.assertEqual(1, normal["items"][0]["counterevidence_count"])
+
     def test_recall_metadata_reconciliation_is_reviewable_and_reflection_scoped(self):
         self.db.insert("source", "This remains an unresolved question.", memory_layer="event")
         self.db.insert("abandoned-source", "Old event", memory_layer="event")
+        self.db.insert(
+            "identity-core", "Stable confirmed identity", memory_layer="core",
+            epistemic_status="confirmed",
+        )
         self.db.create_reflection(
             reflection_id="live-question", source_event_ids=["source"],
             trigger_type="unresolved", selection_reason="fixture",
@@ -209,6 +262,12 @@ class DataCorrectnessTests(unittest.TestCase):
             plan["reflection_question_updates"][0]["proposed"]["open_questions"],
         )
         self.assertEqual(["source"], [item["memory_id"] for item in plan["text_review_candidates"]])
+        core_candidate = next(
+            item for item in plan["salience_review_candidates"]
+            if item["memory_id"] == "identity-core"
+        )
+        self.assertEqual(0.8, core_candidate["suggested_salience"])
+        self.assertTrue(core_candidate["manual_review_required"])
         self.assertFalse(self.db.get("source")["unresolved"])
         self.assertFalse(self.db.get("abandoned-source")["unresolved"])
 

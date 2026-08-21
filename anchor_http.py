@@ -141,11 +141,15 @@ def create_http_server(db_path: str, pinned_dir: str | None = None) -> FastMCP:
     def wakeup(n_high_emotion: int = 5, n_random: int = 2,
                high_emotion_days: int = 3, n_recent: int = 5,
                n_salient: int = 3, n_unresolved: int = 3,
+               n_identity: int = 5, n_reflections: int = 2,
+               include_draft_reflections: bool = False,
                debug: bool = False) -> dict[str, Any]:
         return invoke("wakeup", {
             "n_high_emotion": n_high_emotion, "n_random": n_random,
             "high_emotion_days": high_emotion_days, "n_recent": n_recent,
             "n_salient": n_salient, "n_unresolved": n_unresolved, "debug": debug,
+            "n_identity": n_identity, "n_reflections": n_reflections,
+            "include_draft_reflections": include_draft_reflections,
         })
 
     @server.tool(description="Search event evidence with provenance and related Reflections. Read-only.", annotations=READ_ONLY)

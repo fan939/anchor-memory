@@ -29,8 +29,8 @@ sys.path.insert(0, os.path.dirname(__file__))
 import anchor_pinned
 
 
-SERVER_VERSION = "1.14.2"
-TOOL_SCHEMA_VERSION = "1.3"
+SERVER_VERSION = "1.15.0"
+TOOL_SCHEMA_VERSION = "1.4"
 TOOL_SCHEMA_META_KEY = "anchor/schema_version"
 
 
@@ -685,6 +685,10 @@ def create_server(db_path: str = "./anchor_data", pinned_dir: str = None):
             "n_recent": {"type": "integer", "minimum": 0, "maximum": 20, "default": 5},
             "n_salient": {"type": "integer", "minimum": 0, "maximum": 20, "default": 3},
             "n_unresolved": {"type": "integer", "minimum": 0, "maximum": 20, "default": 3},
+            "n_identity": {"type": "integer", "minimum": 0, "maximum": 20, "default": 5},
+            "n_reflections": {"type": "integer", "minimum": 0, "maximum": 20, "default": 2},
+            "include_draft_reflections": {"type": "boolean", "default": False,
+                "description": "Draft Reflections are excluded from normal cold start unless explicitly requested."},
             "debug": {"type": "boolean", "default": False,
                       "description": "Audit-only filter explanations; filtered content is never put in normal sections."},
         },
@@ -1006,6 +1010,7 @@ def create_server(db_path: str = "./anchor_data", pinned_dir: str = None):
                     n_recent=args.get("n_recent", 5),
                     n_salient=args.get("n_salient", 3),
                     n_unresolved=args.get("n_unresolved", 3),
+                    n_identity=args.get("n_identity", 5),
                     debug=args.get("debug", False),
                 )
                 # Pinned file layer — session_state (rolling state), timeline
@@ -1018,7 +1023,12 @@ def create_server(db_path: str = "./anchor_data", pinned_dir: str = None):
                     text = anchor_pinned.read_file(pinned_dir, fname)
                     if text:
                         result[key] = text
-                result["recent_reflections"] = mem.db.search_reflections(limit=3)
+                reflection_bundle = mem.db.wakeup_reflections(
+                    limit=args.get("n_reflections", 2),
+                    include_drafts=args.get("include_draft_reflections", False),
+                )
+                result["recent_reflections"] = reflection_bundle["items"]
+                result["reflection_policy"] = reflection_bundle["policy"]
                 return result
 
             elif name == "write_session_state":
@@ -1221,6 +1231,8 @@ def format_wakeup_text(data: dict) -> str:
             lines.append(fmt(it))
         lines.append("")
 
+    section("Identity / confirmed Core", data.get("identity_snapshot", []),
+            lambda m: f"- [{m['memory_id']}] {m['text']}")
     section("Pinned", data.get("pinned", []),
             lambda m: f"- [{m['memory_id']}] {m['text']}")
     section("Recent (newest first)", data.get("recent", []),
@@ -1240,6 +1252,9 @@ def format_wakeup_text(data: dict) -> str:
     section("Unread comments", data.get("unread_comments", []),
             lambda c: f"- [{c['comment_id']}] on [{c['memory_id']}] "
                       f"({c['author']}, {c['created_at'][:10]}): {c['content']}")
+    section("Reviewed recent Reflections", data.get("recent_reflections", []),
+            lambda r: f"- [{r['reflection_id']}] ({r['status']}; confidence "
+                      f"{r['confidence']:.2f}) {r['current_interpretation']}")
 
     return "\n".join(lines).strip()
 

@@ -252,7 +252,7 @@ Restart Claude Code. Your AI now has these tools:
 - `pin_memory` / `unpin_memory` — pin explicitly confirmed Core memories for `wakeup()`
 - `update_memory_metadata` — change salience, motifs, state, unresolved status, or open questions in one call without changing truth status
 - `reconcile` — report or repair SQLite/Chroma drift
-- `wakeup` — cold-start bundle (pinned + recent + salient + unresolved + high-emotion + 1–2 random + unread comments + recall hints + session files)
+- `wakeup` — versioned cold-start bundle (stable Identity/Core snapshot + unresolved active state + reviewed salience + deduplicated recent/history + compact reviewed Reflections + unread comments + recall hints + session files). Draft Reflections are opt-in.
 - `write_session_state` — the AI's own rolling state across windows (auto-archived, continuity-headered)
 - `mark_comments_read` — clear the unread queue after processing
 - `comment` — leave a comment under a memory (turns memories into dialogue spaces)
@@ -456,7 +456,7 @@ Safety: random old memories may create temporary Hebbian edges through co-activa
 
 **MCP usage** (since v1.7.2):
 ```
-wakeup() → returns {pinned, recent, salient, unresolved, recall_hints, high_emotion, random_old, unread_comments}
+wakeup() → returns {cold_start_contract, identity_snapshot, pinned, recent, salient, unresolved, recall_hints, high_emotion, random_old, unread_comments, recent_reflections, reflection_policy}
 mark_comments_read([id1, id2, ...]) → after processing unread
 ```
 
@@ -493,7 +493,7 @@ This feature was suggested by Veille & 吱吱 based on their single-system archi
 
 ## Release notes
 
-Per-version notes live in [`docs/release-notes/`](docs/release-notes/). Most recent: [v1.14.2](docs/release-notes/v1.14.2.md).
+Per-version notes live in [`docs/release-notes/`](docs/release-notes/). Most recent: [v1.15.0](docs/release-notes/v1.15.0.md).
 
 ## Origin
 

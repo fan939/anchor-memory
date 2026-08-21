@@ -75,6 +75,10 @@ class McpReflectionTests(unittest.TestCase):
         self.assertIn("update_memory_metadata", by_name)
         self.assertIn("reconcile_recall_metadata", by_name)
         self.assertNotIn("update_memory_recall_state", by_name)
+        wakeup = by_name["wakeup"]["inputSchema"]["properties"]
+        self.assertEqual(5, wakeup["n_identity"]["default"])
+        self.assertEqual(2, wakeup["n_reflections"]["default"])
+        self.assertFalse(wakeup["include_draft_reflections"]["default"])
         draft = by_name["draft_reflection"]["inputSchema"]
         self.assertIn("user_invite", draft["properties"]["trigger_type"]["enum"])
         self.assertEqual(
