@@ -25,6 +25,13 @@ class FakeMemory:
     def update_recall_state(self, memory_id, **metadata):
         return self.db.update_recall_state(memory_id, **metadata)
 
+    def reconcile_recall_metadata(self, dry_run=True, maintenance_id="", max_candidates=100):
+        return {
+            "status": "preview" if dry_run else "complete",
+            "dry_run": dry_run, "maintenance_id": maintenance_id,
+            "max_candidates": max_candidates,
+        }
+
 
 class McpReflectionTests(unittest.TestCase):
     def setUp(self):
@@ -66,6 +73,7 @@ class McpReflectionTests(unittest.TestCase):
         self.assertIn("pin_memory", by_name)
         self.assertIn("unpin_memory", by_name)
         self.assertIn("update_memory_metadata", by_name)
+        self.assertIn("reconcile_recall_metadata", by_name)
         self.assertNotIn("update_memory_recall_state", by_name)
         draft = by_name["draft_reflection"]["inputSchema"]
         self.assertIn("user_invite", draft["properties"]["trigger_type"]["enum"])
@@ -87,6 +95,14 @@ class McpReflectionTests(unittest.TestCase):
         self.assertEqual(0.9, updated["memory"]["salience"])
         self.assertEqual(["repeated-choice"], updated["memory"]["motifs"])
         self.assertTrue(updated["memory"]["unresolved"])
+
+        reconciliation = self.handle("reconcile_recall_metadata", {
+            "dry_run": True, "max_candidates": 20,
+        })
+        self.assertEqual("preview", reconciliation["status"])
+        schema = by_name["reconcile_recall_metadata"]["inputSchema"]
+        self.assertEqual(True, schema["properties"]["dry_run"]["default"])
+        self.assertIn("maintenance_id", schema["allOf"][0]["then"]["required"])
 
     def test_mcp_minimum_reflection_closure(self):
         draft_args = {

@@ -93,7 +93,7 @@ class HttpSchemaTests(unittest.TestCase):
             "search_reflections", "record_reflection_effect",
             "append_reflection_evidence", "retract_reflection",
             "record_memory_feedback", "update_memory_metadata", "get_links",
-            "pin_memory", "unpin_memory",
+            "pin_memory", "unpin_memory", "reconcile_recall_metadata",
         }
         self.assertTrue(expected.issubset(by_name))
         self.assertTrue(by_name["draft_reflection"].annotations.readOnlyHint)

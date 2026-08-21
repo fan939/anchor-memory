@@ -754,6 +754,68 @@ class AnchorMemory:
             )
             raise
 
+    def reconcile_recall_metadata(self, dry_run: bool = True,
+                                  maintenance_id: str = "",
+                                  max_candidates: int = 100) -> dict:
+        """Review or apply explicit Reflection-question metadata synchronization.
+
+        The operation never infers unresolved status from prose and never writes
+        a suggested salience score. Only open questions explicitly saved on a
+        non-abandoned Reflection can be synchronized to its source event.
+        """
+        if not dry_run and not maintenance_id.strip():
+            raise ValueError("maintenance_id is required when dry_run is false")
+        run_id = maintenance_id.strip() or f"recall_metadata_{uuid.uuid4().hex[:12]}"
+        existing = self.db.get_maintenance_run(run_id)
+        if existing:
+            return {"status": "already_recorded", "maintenance_run": existing}
+
+        preview = self.db.plan_recall_metadata_reconciliation(max_candidates)
+        if not dry_run and preview["summary"]["truncated"]:
+            raise ValueError("increase max_candidates before applying a truncated review plan")
+        parameters = {"max_candidates": max_candidates}
+        self.db.start_maintenance_run(
+            run_id, "reconcile_recall_metadata", dry_run, parameters, preview
+        )
+        if dry_run:
+            result = {"status": "preview", "run_id": run_id, "preview": preview}
+            self.db.finish_maintenance_run(run_id, "previewed", result)
+            return result
+
+        previous = []
+        applied = []
+        result = {"status": "complete", "run_id": run_id, "preview": preview}
+        try:
+            for item in preview["reflection_question_updates"]:
+                memory_id = item["memory_id"]
+                before = self.db.get(memory_id)
+                previous.append((memory_id, before))
+                self.update_recall_state(
+                    memory_id,
+                    unresolved=True,
+                    open_questions=item["proposed"]["open_questions"],
+                )
+                applied.append(memory_id)
+            result["applied_memory_ids"] = applied
+            result["applied_count"] = len(applied)
+            result["salience_review_candidates"] = preview["salience_review_candidates"]
+            result["text_review_candidates"] = preview["text_review_candidates"]
+            self.db.finish_maintenance_run(run_id, "complete", result)
+            return result
+        except Exception as exc:
+            for memory_id, before in reversed(previous):
+                try:
+                    self.update_recall_state(
+                        memory_id,
+                        salience=before.get("salience"), motifs=before.get("motifs"),
+                        state=before.get("state"), unresolved=before.get("unresolved"),
+                        open_questions=before.get("open_questions"),
+                    )
+                except Exception:
+                    pass
+            self.db.finish_maintenance_run(run_id, "failed", result, str(exc))
+            raise
+
     def merge_memories(self, survivor_id: str, duplicate_id: str) -> dict:
         """Fold `duplicate_id` into `survivor_id`, then delete the duplicate
         from both stores. The survivor keeps its own text/vector/id; only

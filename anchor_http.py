@@ -187,6 +187,15 @@ def create_http_server(db_path: str, pinned_dir: str | None = None) -> FastMCP:
                 payload[key] = value
         return invoke("update_memory_metadata", payload)
 
+    @server.tool(description="Preview or explicitly apply source-linked Reflection-question synchronization. Never infers from prose or changes salience automatically.", annotations=WRITE)
+    def reconcile_recall_metadata(
+        dry_run: bool = True, maintenance_id: str = "", max_candidates: int = 100,
+    ) -> dict[str, Any]:
+        return invoke("reconcile_recall_metadata", {
+            "dry_run": dry_run, "maintenance_id": maintenance_id,
+            "max_candidates": max_candidates,
+        })
+
     @server.tool(description="Store durable memory with explicit provenance.", annotations=WRITE)
     def store_memory(text: str, tag: str = "general", tier: str = "long",
                      emotion_score: float = 0.5, perspective: str = "mixed",

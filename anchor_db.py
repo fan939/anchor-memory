@@ -573,6 +573,129 @@ class AnchorDB:
         self.log_event(memory_id, "recall_state_updated", ",".join(updates))
         return self.get(memory_id)
 
+    def plan_recall_metadata_reconciliation(self, max_candidates: int = 100) -> dict:
+        """Build a reviewable, non-mutating plan for recall metadata repair.
+
+        Only explicitly stored Reflection questions are eligible for automatic
+        synchronization. Text markers are returned as review leads, never as
+        writes: a phrase such as "unresolved" is evidence to inspect, not an
+        instruction to label a person's state.
+        """
+        max_candidates = max(1, min(int(max_candidates), 500))
+        visible = "m.epistemic_status != 'retracted' AND m.state != 'superseded'"
+        with self._conn() as conn:
+            reflection_rows = conn.execute(
+                """
+                SELECT rs.memory_id, r.reflection_id, r.status, r.open_questions,
+                       COUNT(re.reflection_id) AS effect_count,
+                       m.salience, m.unresolved, m.open_questions AS memory_questions
+                FROM reflections r
+                JOIN reflection_sources rs ON rs.reflection_id = r.reflection_id
+                JOIN memories m ON m.memory_id = rs.memory_id
+                LEFT JOIN reflection_effects re ON re.reflection_id = r.reflection_id
+                WHERE r.status != 'abandoned' AND """ + visible + """
+                GROUP BY rs.memory_id, r.reflection_id
+                ORDER BY m.timestamp DESC, r.created_at DESC
+                """
+            ).fetchall()
+            text_rows = conn.execute(
+                """
+                SELECT memory_id, text FROM memories m
+                WHERE """ + visible + """ AND unresolved = 0
+                ORDER BY timestamp DESC
+                """
+            ).fetchall()
+            default_salience_count = conn.execute(
+                "SELECT COUNT(*) AS n FROM memories m WHERE " + visible + " AND salience = 0.5"
+            ).fetchone()["n"]
+            abandoned_count = conn.execute(
+                "SELECT COUNT(*) AS n FROM reflections WHERE status = 'abandoned'"
+            ).fetchone()["n"]
+
+        grouped: dict[str, dict] = {}
+        for row in reflection_rows:
+            item = dict(row)
+            questions = self._json_value(item.get("open_questions"), [])
+            if not questions:
+                continue
+            target = grouped.setdefault(item["memory_id"], {
+                "memory_id": item["memory_id"],
+                "current_unresolved": bool(item["unresolved"]),
+                "current_open_questions": self._json_value(item.get("memory_questions"), []),
+                "proposed_open_questions": [],
+                "reflection_ids": [], "reflection_statuses": [], "effect_count": 0,
+                "current_salience": float(item["salience"]),
+            })
+            target["proposed_open_questions"] = list(dict.fromkeys(
+                target["proposed_open_questions"] + questions
+            ))
+            target["reflection_ids"].append(item["reflection_id"])
+            target["reflection_statuses"].append(item["status"])
+            target["effect_count"] += int(item["effect_count"] or 0)
+
+        question_updates = []
+        salience_review = []
+        for target in grouped.values():
+            merged_questions = list(dict.fromkeys(
+                target["current_open_questions"] + target["proposed_open_questions"]
+            ))
+            if not target["current_unresolved"] or merged_questions != target["current_open_questions"]:
+                question_updates.append({
+                    "memory_id": target["memory_id"],
+                    "current": {
+                        "unresolved": target["current_unresolved"],
+                        "open_questions": target["current_open_questions"],
+                    },
+                    "proposed": {"unresolved": True, "open_questions": merged_questions},
+                    "reflection_ids": target["reflection_ids"],
+                    "reflection_statuses": sorted(set(target["reflection_statuses"])),
+                    "reason": "non-abandoned Reflection open_questions are explicit source-linked metadata",
+                })
+            suggested = 0.85 if target["effect_count"] else 0.70
+            if target["current_salience"] < suggested:
+                salience_review.append({
+                    "memory_id": target["memory_id"],
+                    "current_salience": target["current_salience"],
+                    "suggested_salience": suggested,
+                    "reason": (
+                        "Reflection informed a recorded decision" if target["effect_count"]
+                        else "source of a live Reflection with explicit open questions"
+                    ),
+                    "manual_review_required": True,
+                })
+
+        markers = ("未解决", "尚未解决", "没有答案", "尚无答案", "待确认", "待回答",
+                   "unresolved", "open question")
+        text_review = []
+        for row in text_rows:
+            matched = [marker for marker in markers if marker.lower() in row["text"].lower()]
+            if matched:
+                text_review.append({
+                    "memory_id": row["memory_id"], "markers": matched,
+                    "manual_review_required": True,
+                    "reason": "text contains an unresolved-state marker; no automatic write is permitted",
+                })
+
+        def cap(items):
+            return items[:max_candidates]
+
+        return {
+            "operation": "reconcile_recall_metadata",
+            "reflection_question_updates": cap(question_updates),
+            "salience_review_candidates": cap(salience_review),
+            "text_review_candidates": cap(text_review),
+            "summary": {
+                "reflection_question_updates": len(question_updates),
+                "salience_review_candidates": len(salience_review),
+                "text_review_candidates": len(text_review),
+                "default_salience_count": default_salience_count,
+                "excluded_abandoned_reflections": abandoned_count,
+                "truncated": any(len(items) > max_candidates for items in (
+                    question_updates, salience_review, text_review,
+                )),
+            },
+        }
+
     def delete(self, memory_id: str):
         with self._conn() as conn:
             # Application-level cascade: some SQLite builds (notably Windows

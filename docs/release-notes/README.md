@@ -2,6 +2,7 @@
 
 Most recent first. Each note follows the same shape: what changed, why it matters, what to do about it.
 
+- [v1.14.2](v1.14.2.md) — 2026-08-21 · reviewable Reflection-question metadata reconciliation
 - [v1.14.1](v1.14.1.md) — 2026-08-21 · versioned authoritative tool discovery · recall regression cases
 - [v1.14](v1.14.md) — 2026-08-21 · salient recall · safe maintenance · metadata and graph observability
 - [v1.13](v1.13.md) — 2026-08-20 · production OAuth and remote MCP hardening

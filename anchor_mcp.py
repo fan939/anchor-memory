@@ -29,8 +29,8 @@ sys.path.insert(0, os.path.dirname(__file__))
 import anchor_pinned
 
 
-SERVER_VERSION = "1.14.1"
-TOOL_SCHEMA_VERSION = "1.2"
+SERVER_VERSION = "1.14.2"
+TOOL_SCHEMA_VERSION = "1.3"
 TOOL_SCHEMA_META_KEY = "anchor/schema_version"
 
 
@@ -734,6 +734,25 @@ def create_server(db_path: str = "./anchor_data", pinned_dir: str = None):
             "minProperties": 2,
         },
     })
+    TOOLS.append({
+        "name": "reconcile_recall_metadata",
+        "description": "Preview or explicitly apply synchronization of saved, non-abandoned Reflection open questions to source memories. Never infers from prose and never automatically changes salience.",
+        "inputSchema": {
+            "type": "object", "additionalProperties": False,
+            "properties": {
+                "dry_run": {"type": "boolean", "default": True,
+                            "description": "Preview only unless explicitly set to false."},
+                "maintenance_id": {"type": "string", "minLength": 1,
+                                   "description": "Required to apply; provides audit and idempotency."},
+                "max_candidates": {"type": "integer", "minimum": 1, "maximum": 500,
+                                   "default": 100},
+            },
+            "allOf": [{
+                "if": {"properties": {"dry_run": {"const": False}}, "required": ["dry_run"]},
+                "then": {"required": ["maintenance_id"]},
+            }],
+        },
+    })
     for tool in TOOLS:
         tool["inputSchema"].setdefault("additionalProperties", False)
     tool_map["search_memory"]["inputSchema"]["properties"]["n"].update(
@@ -894,6 +913,13 @@ def create_server(db_path: str = "./anchor_data", pinned_dir: str = None):
                         open_questions=args.get("open_questions"),
                     ),
                 }
+
+            elif name == "reconcile_recall_metadata":
+                return mem.reconcile_recall_metadata(
+                    dry_run=args.get("dry_run", True),
+                    maintenance_id=args.get("maintenance_id", ""),
+                    max_candidates=args.get("max_candidates", 100),
+                )
 
             elif name == "retract_memory":
                 ok = mem.retract(

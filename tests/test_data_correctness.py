@@ -181,6 +181,55 @@ class DataCorrectnessTests(unittest.TestCase):
         self.assertNotIn("audit", normal)
         self.assertIn("gone", {item["memory_id"] for item in audit["audit"]["filtered_memories"]})
 
+    def test_recall_metadata_reconciliation_is_reviewable_and_reflection_scoped(self):
+        self.db.insert("source", "This remains an unresolved question.", memory_layer="event")
+        self.db.insert("abandoned-source", "Old event", memory_layer="event")
+        self.db.create_reflection(
+            reflection_id="live-question", source_event_ids=["source"],
+            trigger_type="unresolved", selection_reason="fixture",
+            previous_interpretation="old", current_interpretation="new",
+            change_or_tension="open", confidence=0.5,
+            open_questions=["What would settle this?"], counterevidence=[],
+            provenance={"fixture": "test"}, status="tentative",
+        )
+        self.db.create_reflection(
+            reflection_id="abandoned-question", source_event_ids=["abandoned-source"],
+            trigger_type="unresolved", selection_reason="fixture",
+            previous_interpretation="old", current_interpretation="new",
+            change_or_tension="open", confidence=0.5,
+            open_questions=["This must stay out."], counterevidence=[],
+            provenance={"fixture": "test"}, status="abandoned",
+        )
+
+        plan = self.db.plan_recall_metadata_reconciliation()
+
+        self.assertEqual(["source"], [item["memory_id"] for item in plan["reflection_question_updates"]])
+        self.assertEqual(
+            ["What would settle this?"],
+            plan["reflection_question_updates"][0]["proposed"]["open_questions"],
+        )
+        self.assertEqual(["source"], [item["memory_id"] for item in plan["text_review_candidates"]])
+        self.assertFalse(self.db.get("source")["unresolved"])
+        self.assertFalse(self.db.get("abandoned-source")["unresolved"])
+
+        memory = AnchorMemory.__new__(AnchorMemory)
+        memory.db = self.db
+        memory._collection = FakeCollection([])
+        preview = AnchorMemory.reconcile_recall_metadata(memory, dry_run=True)
+        self.assertEqual("preview", preview["status"])
+        self.assertFalse(self.db.get("source")["unresolved"])
+
+        applied = AnchorMemory.reconcile_recall_metadata(
+            memory, dry_run=False, maintenance_id="recall-metadata-fixture"
+        )
+        self.assertEqual(["source"], applied["applied_memory_ids"])
+        self.assertTrue(self.db.get("source")["unresolved"])
+        self.assertEqual(["What would settle this?"], self.db.get("source")["open_questions"])
+        repeated = AnchorMemory.reconcile_recall_metadata(
+            memory, dry_run=False, maintenance_id="recall-metadata-fixture"
+        )
+        self.assertEqual("already_recorded", repeated["status"])
+
     def test_explicit_link_relation_is_readable_in_both_directions(self):
         self.db.insert("a", "a")
         self.db.insert("b", "b")
