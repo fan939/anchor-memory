@@ -713,8 +713,8 @@ def create_server(db_path: str = "./anchor_data", pinned_dir: str = None):
         },
     })
     TOOLS.append({
-        "name": "update_memory_recall_state",
-        "description": "Update salience, motifs, state, or open questions. This never changes epistemic status or memory layer.",
+        "name": "update_memory_metadata",
+        "description": "Update salience, motifs, state, unresolved status, or open questions in one call. This never changes epistemic status or memory layer.",
         "inputSchema": {
             "type": "object", "additionalProperties": False,
             "properties": {
@@ -868,7 +868,7 @@ def create_server(db_path: str = "./anchor_data", pinned_dir: str = None):
                     reflections = mem.db.get_reflections_for_event(args["memory_id"])
                 return {"memory": row, "reflections": reflections}
 
-            elif name == "update_memory_recall_state":
+            elif name in {"update_memory_metadata", "update_memory_recall_state"}:
                 recall_fields = {"salience", "motifs", "state", "unresolved", "open_questions"}
                 if not recall_fields.intersection(args):
                     return failure("at least one recall-state field is required", "validation_error")

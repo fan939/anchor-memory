@@ -3,14 +3,14 @@
 import argparse
 import hmac
 import os
-from typing import Any
+from typing import Any, Literal
 
 from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.exceptions import ToolError
 from mcp.server.auth.settings import AuthSettings
 from mcp.server.transport_security import TransportSecuritySettings
 from mcp.types import ToolAnnotations
-from pydantic import AnyHttpUrl
+from pydantic import AnyHttpUrl, BaseModel, ConfigDict, Field
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
@@ -41,6 +41,24 @@ DESTRUCTIVE = ToolAnnotations(
     readOnlyHint=False, destructiveHint=True, idempotentHint=False,
     openWorldHint=False,
 )
+
+
+ReflectionTrigger = Literal[
+    "user_invite", "current_event", "contradiction", "unresolved",
+    "repeated_tendency", "curiosity", "event_count", "active_day",
+    "random_non_hot", "background_task",
+]
+
+
+class ReflectionProvenance(BaseModel):
+    """Strict provenance contract advertised by the HTTP MCP transport."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    model: str = Field(min_length=1)
+    thread_id: str = Field(min_length=1)
+    context_ref: str = Field(min_length=1)
+    extractor_version: str = Field(min_length=1)
 
 
 def create_http_server(db_path: str, pinned_dir: str | None = None) -> FastMCP:
@@ -147,8 +165,8 @@ def create_http_server(db_path: str, pinned_dir: str | None = None) -> FastMCP:
     def get_memory(memory_id: str) -> dict[str, Any]:
         return invoke("get_memory", {"memory_id": memory_id})
 
-    @server.tool(description="Update recall-only salience, motifs, state, or open questions.", annotations=WRITE)
-    def update_memory_recall_state(
+    @server.tool(description="Update salience, motifs, state, unresolved status, or open questions in one call. This never changes truth status or memory layer.", annotations=WRITE)
+    def update_memory_metadata(
         memory_id: str, salience: float | None = None,
         motifs: list[str] | None = None, state: str | None = None,
         unresolved: bool | None = None,
@@ -161,7 +179,7 @@ def create_http_server(db_path: str, pinned_dir: str | None = None) -> FastMCP:
         }.items():
             if value is not None:
                 payload[key] = value
-        return invoke("update_memory_recall_state", payload)
+        return invoke("update_memory_metadata", payload)
 
     @server.tool(description="Store durable memory with explicit provenance.", annotations=WRITE)
     def store_memory(text: str, tag: str = "general", tier: str = "long",
@@ -255,11 +273,11 @@ def create_http_server(db_path: str, pinned_dir: str | None = None) -> FastMCP:
 
     @server.tool(description="Create a validated, non-persistent Reflection draft.", annotations=READ_ONLY)
     def draft_reflection(
-        source_event_ids: list[str], trigger_type: str,
+        source_event_ids: list[str], trigger_type: ReflectionTrigger,
         selection_reason: str, previous_interpretation: str,
         current_interpretation: str, change_or_tension: str,
         confidence: float, open_questions: list[str],
-        counterevidence: list[Any], provenance: dict[str, Any],
+        counterevidence: list[Any], provenance: ReflectionProvenance,
         status: str = "draft", supersedes: str = "",
     ) -> dict[str, Any]:
         return invoke("draft_reflection", {
@@ -269,7 +287,8 @@ def create_http_server(db_path: str, pinned_dir: str | None = None) -> FastMCP:
             "current_interpretation": current_interpretation,
             "change_or_tension": change_or_tension, "confidence": confidence,
             "open_questions": open_questions, "counterevidence": counterevidence,
-            "provenance": provenance, "status": status, "supersedes": supersedes,
+            "provenance": provenance.model_dump(),
+            "status": status, "supersedes": supersedes,
         })
 
     @server.tool(description="Explicitly persist a reviewed Reflection draft.", annotations=WRITE)

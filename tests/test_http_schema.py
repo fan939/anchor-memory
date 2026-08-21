@@ -46,7 +46,10 @@ class HttpSchemaTests(unittest.TestCase):
                 "selection_reason": "reason", "previous_interpretation": "old",
                 "current_interpretation": "new", "change_or_tension": "changed",
                 "confidence": 0.5, "open_questions": [], "counterevidence": [],
-                "provenance": {},
+                "provenance": {
+                    "model": "test-model", "thread_id": "test-thread",
+                    "context_ref": "turns:1-2", "extractor_version": "test-v1",
+                },
             }))
             with self.assertRaises(ToolError):
                 asyncio.run(server.call_tool("search_reflections", {}))
@@ -74,7 +77,8 @@ class HttpSchemaTests(unittest.TestCase):
             "list_reflection_candidates", "draft_reflection", "save_reflection",
             "search_reflections", "record_reflection_effect",
             "append_reflection_evidence", "retract_reflection",
-            "record_memory_feedback",
+            "record_memory_feedback", "update_memory_metadata", "get_links",
+            "pin_memory", "unpin_memory",
         }
         self.assertTrue(expected.issubset(by_name))
         self.assertTrue(by_name["draft_reflection"].annotations.readOnlyHint)
@@ -82,6 +86,14 @@ class HttpSchemaTests(unittest.TestCase):
         self.assertFalse(by_name["record_memory_feedback"].annotations.readOnlyHint)
         self.assertTrue(by_name["retract_reflection"].annotations.destructiveHint)
         self.assertIn("source_event_ids", by_name["draft_reflection"].inputSchema["properties"])
+        draft_schema = by_name["draft_reflection"].inputSchema
+        self.assertIn("user_invite", draft_schema["properties"]["trigger_type"]["enum"])
+        provenance_ref = draft_schema["properties"]["provenance"]["$ref"]
+        provenance_name = provenance_ref.rsplit("/", 1)[-1]
+        self.assertEqual(
+            ["model", "thread_id", "context_ref", "extractor_version"],
+            draft_schema["$defs"][provenance_name]["required"],
+        )
 
     def test_http_tools_list_uses_authoritative_raw_schema(self):
         import anchor_http

@@ -22,6 +22,9 @@ class FakeMemory:
         os.makedirs(db_path, exist_ok=True)
         self.db = AnchorDB(os.path.join(db_path, "memories.db"))
 
+    def update_recall_state(self, memory_id, **metadata):
+        return self.db.update_recall_state(memory_id, **metadata)
+
 
 class McpReflectionTests(unittest.TestCase):
     def setUp(self):
@@ -56,11 +59,30 @@ class McpReflectionTests(unittest.TestCase):
         self.assertEqual(0.0, store["properties"]["salience"]["minimum"])
         self.assertEqual(3, by_name["search_multi"]["inputSchema"]["properties"]["queries"]["maxItems"])
         self.assertIn("get_links", by_name)
-        self.assertIn("update_memory_recall_state", by_name)
+        self.assertIn("pin_memory", by_name)
+        self.assertIn("unpin_memory", by_name)
+        self.assertIn("update_memory_metadata", by_name)
+        self.assertNotIn("update_memory_recall_state", by_name)
+        draft = by_name["draft_reflection"]["inputSchema"]
+        self.assertIn("user_invite", draft["properties"]["trigger_type"]["enum"])
+        self.assertEqual(
+            ["model", "thread_id", "context_ref", "extractor_version"],
+            draft["properties"]["provenance"]["required"],
+        )
 
         failed = self.handle("set_tier", {"memory_id": "missing", "tier": "long"})
         self.assertFalse(failed["ok"])
         self.assertEqual("not_found", failed["error"]["code"])
+
+        updated = self.handle("update_memory_metadata", {
+            "memory_id": "event-mcp", "salience": 0.9,
+            "motifs": ["repeated-choice"], "state": "active",
+            "unresolved": True, "open_questions": ["What changes next?"],
+        })
+        self.assertEqual("updated", updated["status"])
+        self.assertEqual(0.9, updated["memory"]["salience"])
+        self.assertEqual(["repeated-choice"], updated["memory"]["motifs"])
+        self.assertTrue(updated["memory"]["unresolved"])
 
     def test_mcp_minimum_reflection_closure(self):
         draft_args = {

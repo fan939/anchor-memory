@@ -134,7 +134,7 @@ queries are accepted per recall decision.
 Memories now carry lightweight recall state: `salience` (`0..1`), `motifs`,
 `state` (`active`, `weakened`, `resolved`, or `superseded`), `unresolved`, and
 `open_questions`. These fields affect recall only; they never promote a memory
-to Core or change epistemic status. `update_memory_recall_state` can raise or
+to Core or change epistemic status. `update_memory_metadata` can raise or
 lower them later. `wakeup` returns salient and unresolved blocks plus at most
 three `recall_hints`; it excludes retracted/superseded memories and abandoned
 Reflections by default. `debug=true` adds a separate filter audit.
@@ -250,7 +250,7 @@ Restart Claude Code. Your AI now has these tools:
 - `dream_pass` — preview/audit consolidation by default over MCP; pass `dry_run=false` with a maintenance ID to apply
 - `set_emotion` / `set_tier` — tune a memory after the fact
 - `pin_memory` / `unpin_memory` — pin explicitly confirmed Core memories for `wakeup()`
-- `update_memory_recall_state` — change salience, motifs, state, or open questions without changing truth status
+- `update_memory_metadata` — change salience, motifs, state, unresolved status, or open questions in one call without changing truth status
 - `reconcile` — report or repair SQLite/Chroma drift
 - `wakeup` — cold-start bundle (pinned + recent + salient + unresolved + high-emotion + 1–2 random + unread comments + recall hints + session files)
 - `write_session_state` — the AI's own rolling state across windows (auto-archived, continuity-headered)
