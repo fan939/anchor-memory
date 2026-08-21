@@ -79,7 +79,9 @@ Run periodically (like sleep for the brain):
 
 ### Search Debug Mode (v1.6+)
 - Pass `debug=True` to `search()` (or to the `search_memory` MCP tool) to see ranking internals on each result.
-- Returns `raw_distance` (ChromaDB cosine), `citation_boost`, `emotion_boost`, `recency_boost`, `final_score`, and `source` (`vector` | `keyword` | `associative`).
+- Returns semantic and graph/link scores, salience, citation, emotion, recency,
+  feedback and state adjustments, the final score, and a plain-language ranking
+  explanation.
 - Use when rankings look surprising — lets you see which boost pushed which result where, or whether a keyword fallback interleaved.
 
 ### Optional: Daily Emotion Tracker (v1.6+)
@@ -124,7 +126,18 @@ don't surface.
 `search_multi(queries: list[str])` runs each intent as an independent search
 and merges results dedup'd by `memory_id` (best rank wins). MCP searches are
 read-only and do not create graph edges. Programmatic callers may opt into
-co-activation only when `ANCHOR_AUTO_HEBBIAN=true`.
+co-activation only when `ANCHOR_AUTO_HEBBIAN=true`. At most three targeted
+queries are accepted per recall decision.
+
+### Salience and motif recall
+
+Memories now carry lightweight recall state: `salience` (`0..1`), `motifs`,
+`state` (`active`, `weakened`, `resolved`, or `superseded`), `unresolved`, and
+`open_questions`. These fields affect recall only; they never promote a memory
+to Core or change epistemic status. `update_memory_recall_state` can raise or
+lower them later. `wakeup` returns salient and unresolved blocks plus at most
+three `recall_hints`; it excludes retracted/superseded memories and abandoned
+Reflections by default. `debug=true` adds a separate filter audit.
 
 ```python
 # Caller pre-splits the message into intents (using any method — host LLM,
@@ -232,12 +245,14 @@ Restart Claude Code. Your AI now has these tools:
 - `store_memory` — store a memory
 - `search_memory` — read-only search with associative recall
 - `connect_memories` — manually connect two memories
-- `get_neighbors` — inspect a memory's edges
+- `get_neighbors` / `get_links` — inspect related memories or full incoming/outgoing edge audit data
 - `delete_memory` — delete
-- `dream_pass` — run consolidation (daily)
+- `dream_pass` — preview/audit consolidation by default over MCP; pass `dry_run=false` with a maintenance ID to apply
 - `set_emotion` / `set_tier` — tune a memory after the fact
 - `pin_memory` / `unpin_memory` — pin explicitly confirmed Core memories for `wakeup()`
-- `wakeup` — cold-start bundle (pinned + recent + high-emotion + 1–2 random + unread comments + session_state / timeline / previous-window tail when present)
+- `update_memory_recall_state` — change salience, motifs, state, or open questions without changing truth status
+- `reconcile` — report or repair SQLite/Chroma drift
+- `wakeup` — cold-start bundle (pinned + recent + salient + unresolved + high-emotion + 1–2 random + unread comments + recall hints + session files)
 - `write_session_state` — the AI's own rolling state across windows (auto-archived, continuity-headered)
 - `mark_comments_read` — clear the unread queue after processing
 - `comment` — leave a comment under a memory (turns memories into dialogue spaces)
@@ -441,7 +456,7 @@ Safety: random old memories may create temporary Hebbian edges through co-activa
 
 **MCP usage** (since v1.7.2):
 ```
-wakeup() → returns {pinned, high_emotion, random_old, unread_comments}
+wakeup() → returns {pinned, recent, salient, unresolved, recall_hints, high_emotion, random_old, unread_comments}
 mark_comments_read([id1, id2, ...]) → after processing unread
 ```
 

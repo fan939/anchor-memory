@@ -64,7 +64,11 @@ def create_server(db_path: str = "./anchor_data", pinned_dir: str = None):
         "additionalProperties": False,
         "properties": {
             "source_event_ids": {"type": "array", "items": {"type": "string"}, "minItems": 1},
-            "trigger_type": {"type": "string"},
+            "trigger_type": {"type": "string", "enum": [
+                "user_invite", "current_event", "contradiction", "unresolved",
+                "repeated_tendency", "curiosity", "event_count", "active_day",
+                "random_non_hot", "background_task",
+            ]},
             "selection_reason": {"type": "string"},
             "previous_interpretation": {"type": "string"},
             "current_interpretation": {"type": "string"},
@@ -296,7 +300,7 @@ def create_server(db_path: str = "./anchor_data", pinned_dir: str = None):
         },
         {
             "name": "reconcile",
-            "description": "Admin-only dual-store consistency report. Defaults to dry-run; repair only removes Chroma records with no SQLite authority.",
+            "description": "Admin-only dual-store consistency report. Defaults to dry-run; repair removes orphan/audit-only vectors and rebuilds missing active vectors from SQLite authority.",
             "inputSchema": {
                 "type": "object",
                 "properties": {"repair": {"type": "boolean", "default": False}}
@@ -315,7 +319,7 @@ def create_server(db_path: str = "./anchor_data", pinned_dir: str = None):
         },
         {
             "name": "dream_pass",
-            "description": "Run memory consolidation — like sleep for the brain. Decays old memories, prunes weak connections, discovers new ones, equilibrates emotion scores. Run daily.",
+            "description": "Preview or run audited maintenance. MCP defaults to dry-run; an explicit maintenance ID makes retries idempotent.",
             "inputSchema": {
                 "type": "object",
                 "properties": {}
@@ -621,11 +625,141 @@ def create_server(db_path: str = "./anchor_data", pinned_dir: str = None):
         }
     ]
 
+    # Keep the advertised contract aligned with business validation. The same
+    # schemas are reused by the HTTP adapter below, so clients do not discover
+    # constraints only after a rejected write.
+    tool_map = {tool["name"]: tool for tool in TOOLS}
+    store_schema = tool_map["store_memory"]["inputSchema"]
+    store_schema["additionalProperties"] = False
+    store_schema["properties"]["emotion_score"].update({"minimum": 0.0, "maximum": 1.0})
+    store_schema["properties"]["text"]["minLength"] = 1
+    store_schema["properties"].update({
+        "salience": {"type": "number", "minimum": 0.0, "maximum": 1.0, "default": 0.5,
+                     "description": "Recall importance only; never changes truth status or memory layer."},
+        "motifs": {"type": "array", "items": {"type": "string"}, "uniqueItems": True,
+                   "description": "Repeated themes or structures used to guide recall."},
+        "state": {"type": "string", "enum": ["active", "weakened", "resolved", "superseded"],
+                  "default": "active"},
+        "unresolved": {"type": "boolean", "default": False},
+        "open_questions": {"type": "array", "items": {"type": "string"}},
+        "contradicted_by": {"type": "array", "items": {"type": "string"}, "uniqueItems": True,
+                            "description": "Memory IDs providing explicit counterevidence."},
+    })
+    store_schema["allOf"] = [{
+        "if": {"properties": {"memory_layer": {"const": "core"}}, "required": ["memory_layer"]},
+        "then": {"properties": {"epistemic_status": {"const": "confirmed"}},
+                 "required": ["epistemic_status"]},
+    }]
+    tool_map["search_multi"]["inputSchema"]["additionalProperties"] = False
+    tool_map["search_multi"]["inputSchema"]["properties"]["queries"].update(
+        {"minItems": 1, "maxItems": 3}
+    )
+
+    for name in ("search_memory", "get_memory", "get_neighbors", "reconcile",
+                 "retract_memory", "delete_memory", "pin_memory", "unpin_memory",
+                 "draft_reflection", "search_reflections", "save_reflection",
+                 "retract_reflection", "record_memory_feedback",
+                 "record_reflection_effect", "append_reflection_evidence"):
+        if name in tool_map:
+            tool_map[name]["inputSchema"]["additionalProperties"] = False
+
+    tool_map["connect_memories"]["inputSchema"].update({"additionalProperties": False})
+    tool_map["connect_memories"]["inputSchema"]["properties"]["weight"].update(
+        {"minimum": 0.0, "maximum": 10.0}
+    )
+    tool_map["connect_memories"]["inputSchema"]["properties"]["relation"] = {
+        "type": "string", "enum": ["related", "contradicts", "supports", "supersedes"],
+        "default": "related",
+    }
+    tool_map["wakeup"]["inputSchema"] = {
+        "type": "object", "additionalProperties": False,
+        "properties": {
+            "n_high_emotion": {"type": "integer", "minimum": 0, "maximum": 20, "default": 5},
+            "n_random": {"type": "integer", "minimum": 0, "maximum": 20, "default": 2},
+            "high_emotion_days": {"type": "integer", "minimum": 1, "maximum": 3650, "default": 3},
+            "n_recent": {"type": "integer", "minimum": 0, "maximum": 20, "default": 5},
+            "n_salient": {"type": "integer", "minimum": 0, "maximum": 20, "default": 3},
+            "n_unresolved": {"type": "integer", "minimum": 0, "maximum": 20, "default": 3},
+            "debug": {"type": "boolean", "default": False,
+                      "description": "Audit-only filter explanations; filtered content is never put in normal sections."},
+        },
+    }
+    tool_map["dream_pass"]["inputSchema"] = {
+        "type": "object", "additionalProperties": False,
+        "properties": {
+            "dry_run": {"type": "boolean", "default": True},
+            "maintenance_id": {"type": "string", "minLength": 1,
+                               "description": "Caller-provided idempotency and audit ID."},
+            "short_decay_days": {"type": "integer", "minimum": 1, "default": 14},
+            "edge_decay_factor": {"type": "number", "exclusiveMinimum": 0, "maximum": 1, "default": 0.9},
+            "strong_edge_decay_factor": {"type": "number", "exclusiveMinimum": 0, "maximum": 1, "default": 0.95},
+            "emotion_nudge": {"type": "number", "minimum": 0, "maximum": 1, "default": 0.05},
+            "auto_discover": {"type": "boolean", "default": False},
+            "split_bundled": {"type": "boolean", "default": False},
+        },
+    }
+    TOOLS.append({
+        "name": "get_links",
+        "description": "Read auditable incoming/outgoing memory links, including relation, weight, and timestamps.",
+        "inputSchema": {
+            "type": "object", "additionalProperties": False,
+            "properties": {
+                "memory_id": {"type": "string"},
+                "direction": {"type": "string", "enum": ["incoming", "outgoing", "both"], "default": "both"},
+                "min_weight": {"type": "number", "minimum": 0, "maximum": 10, "default": 0},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 500, "default": 100},
+            },
+            "required": ["memory_id"],
+        },
+    })
+    TOOLS.append({
+        "name": "update_memory_recall_state",
+        "description": "Update salience, motifs, state, or open questions. This never changes epistemic status or memory layer.",
+        "inputSchema": {
+            "type": "object", "additionalProperties": False,
+            "properties": {
+                "memory_id": {"type": "string"},
+                "salience": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+                "motifs": {"type": "array", "items": {"type": "string"}, "uniqueItems": True},
+                "state": {"type": "string", "enum": ["active", "weakened", "resolved", "superseded"]},
+                "unresolved": {"type": "boolean"},
+                "open_questions": {"type": "array", "items": {"type": "string"}},
+            },
+            "required": ["memory_id"],
+            "minProperties": 2,
+        },
+    })
+    for tool in TOOLS:
+        tool["inputSchema"].setdefault("additionalProperties", False)
+    tool_map["search_memory"]["inputSchema"]["properties"]["n"].update(
+        {"minimum": 1, "maximum": 50}
+    )
+    tool_map["search_memory"]["inputSchema"]["properties"]["debug"]["description"] = (
+        "Include semantic score, graph/link score, salience, recency, feedback, "
+        "state adjustments, final score, and ranking explanation."
+    )
+    tool_map["set_emotion"]["inputSchema"]["properties"]["score"].update(
+        {"minimum": 0.0, "maximum": 1.0}
+    )
+    tool_map["annotate_memory"]["inputSchema"]["properties"]["text"]["minLength"] = 1
+    tool_map["leave_comment"]["inputSchema"]["properties"]["content"]["minLength"] = 1
+    tool_map["mark_comments_read"]["inputSchema"]["properties"]["comment_ids"]["minItems"] = 1
+    tool_map["search_reflections"]["inputSchema"]["properties"]["status"].update({
+        "enum": ["", "draft", "tentative", "adopted", "shaken", "abandoned"]
+    })
+    trigger_enum = sorted([
+        "user_invite", "current_event", "contradiction", "unresolved",
+        "repeated_tendency", "curiosity", "event_count", "active_day",
+        "random_non_hot", "background_task",
+    ])
+    tool_map["list_reflection_candidates"]["inputSchema"]["properties"]["trigger_type"]["enum"] = trigger_enum
+    tool_map["search_reflections"]["inputSchema"]["properties"]["trigger_type"]["enum"] = [""] + trigger_enum
+
     read_only_tools = {
         "search_memory", "search_multi", "get_memory", "get_neighbors",
         "get_annotations", "wakeup", "search_annotations",
         "list_reflection_candidates", "draft_reflection", "search_reflections",
-        "graph_stats", "get_comments",
+        "graph_stats", "get_comments", "get_links",
     }
     destructive_tools = {
         "delete_memory", "dream_pass", "retract_memory", "retract_reflection",
@@ -642,14 +776,17 @@ def create_server(db_path: str = "./anchor_data", pinned_dir: str = None):
 
     def handle_tool(name: str, args: dict) -> dict:
         """Execute a tool and return result."""
+        def failure(message: str, code: str = "business_error") -> dict:
+            return {"ok": False, "error": {"code": code, "message": str(message), "tool": name}}
+
         try:
             if name == "store_memory":
                 confidence = args.get("confidence", 0.5)
                 if not 0.0 <= confidence <= 1.0:
-                    return {"error": "confidence must be between 0.0 and 1.0"}
+                    return failure("confidence must be between 0.0 and 1.0", "validation_error")
                 emotion_score = args.get("emotion_score", 0.5)
                 if not 0.0 <= emotion_score <= 1.0:
-                    return {"error": "emotion_score must be between 0.0 and 1.0"}
+                    return failure("emotion_score must be between 0.0 and 1.0", "validation_error")
                 mid = f"mem_{uuid.uuid4().hex[:8]}"
                 mem.store(
                     memory_id=mid,
@@ -667,6 +804,12 @@ def create_server(db_path: str = "./anchor_data", pinned_dir: str = None):
                     memory_layer=args.get("memory_layer", "event"),
                     source_ref=args.get("source_ref", ""),
                     provenance=args.get("provenance", {}),
+                    salience=args.get("salience", 0.5),
+                    motifs=args.get("motifs", []),
+                    state=args.get("state", "active"),
+                    unresolved=args.get("unresolved", False),
+                    open_questions=args.get("open_questions", []),
+                    contradicted_by=args.get("contradicted_by", []),
                 )
                 return {"memory_id": mid, "status": "stored"}
 
@@ -700,6 +843,7 @@ def create_server(db_path: str = "./anchor_data", pinned_dir: str = None):
                     args["source_id"],
                     args["target_id"],
                     weight=args.get("weight", 2.0),
+                    relation=args.get("relation", "related"),
                 )
                 return {"status": "connected"}
 
@@ -711,6 +855,12 @@ def create_server(db_path: str = "./anchor_data", pinned_dir: str = None):
                 )
                 return {"neighbors": [dict(n) for n in neighbors]}
 
+            elif name == "get_links":
+                return mem.db.get_links(
+                    args["memory_id"], direction=args.get("direction", "both"),
+                    min_weight=args.get("min_weight", 0.0), limit=args.get("limit", 100),
+                )
+
             elif name == "get_memory":
                 row = mem.db.get(args["memory_id"])
                 reflections = []
@@ -718,29 +868,53 @@ def create_server(db_path: str = "./anchor_data", pinned_dir: str = None):
                     reflections = mem.db.get_reflections_for_event(args["memory_id"])
                 return {"memory": row, "reflections": reflections}
 
+            elif name == "update_memory_recall_state":
+                recall_fields = {"salience", "motifs", "state", "unresolved", "open_questions"}
+                if not recall_fields.intersection(args):
+                    return failure("at least one recall-state field is required", "validation_error")
+                return {
+                    "status": "updated",
+                    "memory": mem.update_recall_state(
+                        args["memory_id"], salience=args.get("salience"),
+                        motifs=args.get("motifs"), state=args.get("state"),
+                        unresolved=args.get("unresolved"),
+                        open_questions=args.get("open_questions"),
+                    ),
+                }
+
             elif name == "retract_memory":
-                ok = mem.db.retract(
+                ok = mem.retract(
                     args["memory_id"], args.get("superseding_memory_id", "")
                 )
-                return {"status": "retracted" if ok else "not_found"}
+                return {"status": "retracted"} if ok else failure("memory not found", "not_found")
 
             elif name == "reconcile":
                 return mem.reconcile(repair=args.get("repair", False))
 
             elif name == "delete_memory":
                 success = mem.delete(args["memory_id"])
-                return {"status": "deleted" if success else "not_found"}
+                return {"status": "deleted"} if success else failure("memory not found or deletion failed", "not_found")
 
             elif name == "dream_pass":
-                stats = mem.dream_pass()
-                return {"status": "complete", **stats}
+                return mem.dream_pass(
+                    short_decay_days=args.get("short_decay_days", 14),
+                    edge_decay_factor=args.get("edge_decay_factor", 0.9),
+                    strong_edge_decay_factor=args.get("strong_edge_decay_factor", 0.95),
+                    emotion_nudge=args.get("emotion_nudge", 0.05),
+                    auto_discover=args.get("auto_discover", False),
+                    dry_run=args.get("dry_run", True),
+                    maintenance_id=args.get("maintenance_id", ""),
+                    split_bundled=args.get("split_bundled", False),
+                )
 
             elif name == "set_emotion":
-                mem.db.set_emotion_score(args["memory_id"], args["score"])
+                if not mem.db.set_emotion_score(args["memory_id"], args["score"]):
+                    return failure("memory not found", "not_found")
                 return {"status": "updated"}
 
             elif name == "set_tier":
-                mem.db.set_tier(args["memory_id"], args["tier"])
+                if not mem.db.set_tier(args["memory_id"], args["tier"]):
+                    return failure("memory not found", "not_found")
                 return {"status": "updated"}
 
             elif name == "graph_stats":
@@ -767,6 +941,8 @@ def create_server(db_path: str = "./anchor_data", pinned_dir: str = None):
 
             elif name == "consolidate":
                 result = mem.consolidate(args["conversation_text"])
+                if result.get("status") == "disabled":
+                    return failure(result.get("reason", "consolidation disabled"), "disabled")
                 return result
 
             elif name == "store_visual":
@@ -789,6 +965,9 @@ def create_server(db_path: str = "./anchor_data", pinned_dir: str = None):
                     n_random=args.get("n_random", 2),
                     high_emotion_days=args.get("high_emotion_days", 3),
                     n_recent=args.get("n_recent", 5),
+                    n_salient=args.get("n_salient", 3),
+                    n_unresolved=args.get("n_unresolved", 3),
+                    debug=args.get("debug", False),
                 )
                 # Pinned file layer — session_state (rolling state), timeline
                 # (event ledger), tail (previous window, mechanical). Present
@@ -824,11 +1003,11 @@ def create_server(db_path: str = "./anchor_data", pinned_dir: str = None):
                 return {"comments": [dict(r) for r in rows]}
 
             elif name == "mark_comments_read":
-                mem.db.mark_comments_read(
+                count = mem.db.mark_comments_read(
                     args["comment_ids"],
                     reader=args.get("reader", "ai"),
                 )
-                return {"status": "marked", "count": len(args["comment_ids"])}
+                return {"status": "marked", "count": count}
 
             elif name == "pin_memory":
                 mem.db.pin(args["memory_id"])
@@ -843,7 +1022,8 @@ def create_server(db_path: str = "./anchor_data", pinned_dir: str = None):
                 return {"results": [dict(r) for r in rows]}
 
             elif name == "cite_memory":
-                mem.db.cite(args["memory_id"])
+                if not mem.db.cite(args["memory_id"]):
+                    return failure("memory not found", "not_found")
                 return {"status": "cited", "memory_id": args["memory_id"]}
 
             elif name == "list_reflection_candidates":
@@ -891,13 +1071,13 @@ def create_server(db_path: str = "./anchor_data", pinned_dir: str = None):
                 ok = mem.db.retract_reflection(
                     args["reflection_id"], args.get("retracted_by", "")
                 )
-                return {"status": "retracted" if ok else "not_found"}
+                return {"status": "retracted"} if ok else failure("reflection not found", "not_found")
 
             else:
-                return {"error": f"Unknown tool: {name}"}
+                return failure(f"Unknown tool: {name}", "unknown_tool")
 
         except Exception as e:
-            return {"error": str(e)}
+            return failure(str(e))
 
     return TOOLS, handle_tool, mem
 
@@ -934,7 +1114,7 @@ def run_stdio(db_path: str, pinned_dir: str = None):
                     "capabilities": {"tools": {}},
                     "serverInfo": {
                         "name": "anchor-memory",
-                        "version": "1.13",
+                        "version": "1.14",
                     }
                 }
             })
@@ -953,11 +1133,14 @@ def run_stdio(db_path: str, pinned_dir: str = None):
             tool_name = msg["params"]["name"]
             tool_args = msg["params"].get("arguments", {})
             result = handle_tool(tool_name, tool_args)
+            is_error = bool(result.get("ok") is False or result.get("error"))
             send({
                 "jsonrpc": "2.0",
                 "id": id_,
                 "result": {
-                    "content": [{"type": "text", "text": json.dumps(result, ensure_ascii=False)}]
+                    "content": [{"type": "text", "text": json.dumps(result, ensure_ascii=False)}],
+                    "structuredContent": result,
+                    "isError": is_error,
                 }
             })
 
@@ -1003,6 +1186,14 @@ def format_wakeup_text(data: dict) -> str:
             lambda m: f"- [{m['memory_id']}] {m['text']}")
     section("Recent (newest first)", data.get("recent", []),
             lambda m: f"- [{m['memory_id']}] ({m['timestamp'][:10]}) {m['text']}")
+    section("High-salience active memories", data.get("salient", []),
+            lambda m: f"- [{m['memory_id']}] (salience {m['salience']:.2f}; "
+                      f"motifs: {', '.join(m.get('motifs', [])) or 'none'}) {m['text']}")
+    section("Unresolved questions", data.get("unresolved", []),
+            lambda m: f"- [{m['memory_id']}] "
+                      f"{'; '.join(m.get('open_questions', [])) or m['text']}")
+    section("Recall hints (use only when current context warrants recall)",
+            data.get("recall_hints", []), lambda hint: f"- {hint}")
     section("Recent high-emotion", data.get("high_emotion", []),
             lambda m: f"- [{m['memory_id']}] (emotion {m['emotion_score']:.2f}) {m['text']}")
     section("Random old", data.get("random_old", []),

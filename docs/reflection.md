@@ -56,6 +56,10 @@ transcripts in provenance. Use stable protected locators.
    `append_reflection_evidence`. Use `retract_reflection` to abandon an
    interpretation without deleting its audit history.
 
+Abandoned Reflections remain available by exact audit paths but are excluded
+from ordinary event retrieval, `search_reflections`, and `wakeup`. Ordinary
+search never drafts or saves a Reflection.
+
 `ANCHOR_REFLECTION_AUTO_SAVE=false` is the supported default. There is no
 background autonomous writer in the first implementation.
 

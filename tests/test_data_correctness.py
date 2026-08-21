@@ -69,6 +69,21 @@ class FakeEmbedder:
         return types.SimpleNamespace(tolist=lambda: [9.0])
 
 
+class QueryCollection:
+    def count(self):
+        return 2
+
+    def query(self, **kwargs):
+        return {
+            "documents": [["low", "high"]],
+            "metadatas": [[
+                {"memory_id": "low", "timestamp": "", "tag": "general"},
+                {"memory_id": "high", "timestamp": "", "tag": "general"},
+            ]],
+            "distances": [[0.4, 0.4]],
+        }
+
+
 class FailingDB:
     def insert(self, *args, **kwargs):
         raise RuntimeError("injected sqlite failure")
@@ -132,6 +147,80 @@ class DataCorrectnessTests(unittest.TestCase):
 
         self.assertAlmostEqual(0.1, self.db.get_emotion_score("zero"))
 
+    def test_zero_salience_and_recall_fields_round_trip(self):
+        self.db.insert(
+            "salient", "recall state", salience=0.0,
+            motifs=["choice", "choice", "response"],
+            open_questions=["What changes next?"],
+        )
+
+        row = self.db.get("salient")
+
+        self.assertEqual(0.0, row["salience"])
+        self.assertEqual(["choice", "response"], row["motifs"])
+        self.assertTrue(row["unresolved"])
+
+    def test_wakeup_excludes_retracted_and_returns_three_recall_hints(self):
+        self.db.insert("gone", "retracted item", salience=1.0)
+        self.db.retract("gone", retracted_by="replacement")
+        self.db.insert(
+            "active", "active item", salience=0.9,
+            motifs=["motif-a", "motif-b"],
+            open_questions=["question-c", "question-d"],
+        )
+
+        normal = self.db.wakeup(n_random=0, debug=False)
+        audit = self.db.wakeup(n_random=0, debug=True)
+        normal_ids = {
+            item["memory_id"] for key in ("pinned", "recent", "high_emotion", "salient", "unresolved")
+            for item in normal[key]
+        }
+
+        self.assertNotIn("gone", normal_ids)
+        self.assertEqual(["motif-a", "motif-b", "question-c"], normal["recall_hints"])
+        self.assertNotIn("audit", normal)
+        self.assertIn("gone", {item["memory_id"] for item in audit["audit"]["filtered_memories"]})
+
+    def test_explicit_link_relation_is_readable_in_both_directions(self):
+        self.db.insert("a", "a")
+        self.db.insert("b", "b")
+        self.db.connect("a", "b", weight=1.25, relation="contradicts")
+
+        links = self.db.get_links("a")
+
+        self.assertEqual("contradicts", links["outgoing"][0]["relation"])
+        self.assertEqual(1.25, links["outgoing"][0]["weight"])
+        self.assertTrue(links["outgoing"][0]["created"])
+
+        self.db.connect("b", "a", weight=0.5, relation="supersedes")
+        directional = self.db.get_links("b")
+        supersedes = [row for row in directional["outgoing"] if row["relation"] == "supersedes"]
+        reverse = [row for row in self.db.get_links("a")["outgoing"] if row["relation"] == "supersedes"]
+        self.assertEqual(1, len(supersedes))
+        self.assertEqual([], reverse)
+
+    def test_dream_dry_run_is_audited_and_does_not_mutate(self):
+        self.db.insert("a", "a")
+        self.db.insert("b", "b")
+        self.db.connect("a", "b", weight=2.0)
+        memory = AnchorMemory.__new__(AnchorMemory)
+        memory.db = self.db
+        memory._collection = FakeCollection(["a", "b"])
+        memory.emotion_equalization = False
+
+        preview = AnchorMemory.dream_pass(
+            memory, dry_run=True, maintenance_id="maintenance-test",
+            auto_discover=False,
+        )
+        repeated = AnchorMemory.dream_pass(
+            memory, dry_run=False, maintenance_id="maintenance-test",
+            auto_discover=False,
+        )
+
+        self.assertEqual("preview", preview["status"])
+        self.assertEqual(2.0, self.db.get_edge_weight("a", "b"))
+        self.assertEqual("already_recorded", repeated["status"])
+
     def test_legacy_records_receive_conservative_provenance_defaults(self):
         self.db.insert("legacy", "old imported record")
 
@@ -154,6 +243,39 @@ class DataCorrectnessTests(unittest.TestCase):
         row = self.db.get("old")
         self.assertEqual("retracted", row["epistemic_status"])
         self.assertEqual("new", row["retracted_by"])
+
+    def test_high_salience_affects_ranking_without_promoting_truth(self):
+        self.db.insert("low", "low", salience=0.0)
+        self.db.insert("high", "high", salience=1.0)
+        memory = AnchorMemory.__new__(AnchorMemory)
+        memory.db = self.db
+        memory._collection = QueryCollection()
+        memory._embedder = FakeEmbedder()
+        memory.recency_weight = 0.0
+        memory.recency_halflife_days = 30.0
+        memory.auto_hebbian = False
+
+        results = AnchorMemory.search(
+            memory, "same semantic distance", n_results=2,
+            associate=False, debug=True,
+        )
+
+        self.assertEqual("high", results[0]["memory_id"])
+        self.assertEqual("reported", results[0]["epistemic_status"])
+        self.assertEqual("event", results[0]["memory_layer"])
+        self.assertEqual(0.15, results[0]["debug"]["salience_boost"])
+        self.assertIn("ranking_reason", results[0]["debug"])
+
+    def test_retract_removes_vector_but_keeps_sqlite_audit_row(self):
+        self.db.insert("same", "original")
+        memory = AnchorMemory.__new__(AnchorMemory)
+        memory.db = self.db
+        memory._collection = SnapshotCollection()
+
+        self.assertTrue(AnchorMemory.retract(memory, "same", "replacement"))
+
+        self.assertNotIn("same", memory._collection.records)
+        self.assertEqual("retracted", self.db.get("same")["epistemic_status"])
 
     def test_reconcile_reports_and_removes_only_chroma_orphans(self):
         self.db.insert("sqlite-only", "needs re-embedding")

@@ -109,6 +109,22 @@ class ReflectionTests(unittest.TestCase):
             self.db.delete("event-1")
         self.assertIsNotNone(self.db.get("event-1"))
 
+    def test_abandoned_reflection_is_hidden_from_normal_recall_but_auditable(self):
+        saved = self.service.save(self._draft()["draft"])
+        reflection_id = saved["reflection_id"]
+
+        self.assertTrue(self.db.retract_reflection(reflection_id, retracted_by="review"))
+
+        self.assertEqual([], self.db.search_reflections())
+        self.assertEqual([], self.db.get_reflections_for_event("event-1"))
+        audit = self.db.search_reflections(include_retracted=True)
+        self.assertEqual(reflection_id, audit[0]["reflection_id"])
+        self.assertEqual("abandoned", audit[0]["status"])
+        self.assertEqual(reflection_id, self.db.search_reflections(status="abandoned")[0]["reflection_id"])
+        self.assertEqual(reflection_id, self.db.get_reflections_for_event(
+            "event-1", include_abandoned=True
+        )[0]["reflection_id"])
+
     def test_save_revalidates_source_ids_and_layer(self):
         draft = self._draft()
         draft["draft"]["source_event_ids"] = ["missing"]

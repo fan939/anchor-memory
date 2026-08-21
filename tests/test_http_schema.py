@@ -25,11 +25,45 @@ class FakeMemory:
 
 @unittest.skipUnless(MCP_AVAILABLE, "MCP SDK is only installed in the HTTP test environment")
 class HttpSchemaTests(unittest.TestCase):
+    def test_reflection_adapter_does_not_inject_invoke_and_raises_tool_error(self):
+        import anchor_http
+        from mcp.server.fastmcp.exceptions import ToolError
+
+        calls = []
+
+        def fake_create_server(db_path, pinned_dir=None):
+            def handle(name, payload):
+                calls.append((name, payload))
+                if name == "search_reflections":
+                    return {"ok": False, "error": {"code": "business_error", "message": "rejected"}}
+                return {"tool": name}
+            return [], handle, FakeMemory()
+
+        with patch.object(anchor_http, "create_server", fake_create_server):
+            server = anchor_http.create_http_server("unused")
+            asyncio.run(server.call_tool("draft_reflection", {
+                "source_event_ids": ["event"], "trigger_type": "user_invite",
+                "selection_reason": "reason", "previous_interpretation": "old",
+                "current_interpretation": "new", "change_or_tension": "changed",
+                "confidence": 0.5, "open_questions": [], "counterevidence": [],
+                "provenance": {},
+            }))
+            with self.assertRaises(ToolError):
+                asyncio.run(server.call_tool("search_reflections", {}))
+
+        draft_payload = calls[0][1]
+        self.assertNotIn("invoke", draft_payload)
+        self.assertNotIn("handle", draft_payload)
+
     def test_fastmcp_registers_reflection_tools_and_annotations(self):
         import anchor_http
 
         def fake_create_server(db_path, pinned_dir=None):
-            return [], lambda name, payload: {"tool": name}, FakeMemory()
+            def handle(name, payload):
+                if name == "search_reflections":
+                    return {"ok": False, "error": {"code": "business_error", "message": "rejected"}}
+                return {"tool": name}
+            return [], handle, FakeMemory()
 
         with patch.object(anchor_http, "create_server", fake_create_server):
             server = anchor_http.create_http_server("unused")
@@ -49,12 +83,35 @@ class HttpSchemaTests(unittest.TestCase):
         self.assertTrue(by_name["retract_reflection"].annotations.destructiveHint)
         self.assertIn("source_event_ids", by_name["draft_reflection"].inputSchema["properties"])
 
+    def test_http_tools_list_uses_authoritative_raw_schema(self):
+        import anchor_http
+
+        authoritative = {
+            "type": "object", "additionalProperties": False,
+            "properties": {"text": {"type": "string", "minLength": 1}},
+            "required": ["text"],
+        }
+
+        def fake_create_server(db_path, pinned_dir=None):
+            return ([{"name": "store_memory", "inputSchema": authoritative}],
+                    lambda name, payload: {"tool": name}, FakeMemory())
+
+        with patch.object(anchor_http, "create_server", fake_create_server):
+            server = anchor_http.create_http_server("unused")
+            by_name = {tool.name: tool for tool in asyncio.run(server.list_tools())}
+
+        self.assertEqual(authoritative, by_name["store_memory"].inputSchema)
+
     def test_streamable_http_protocol_health_and_auth(self):
         import anchor_http
         from starlette.testclient import TestClient
 
         def fake_create_server(db_path, pinned_dir=None):
-            return [], lambda name, payload: {"tool": name}, FakeMemory()
+            def handle(name, payload):
+                if name == "search_reflections":
+                    return {"ok": False, "error": {"code": "business_error", "message": "rejected"}}
+                return {"tool": name}
+            return [], handle, FakeMemory()
 
         environment = {
             "ANCHOR_AUTH_TOKEN": "http-test-token",
@@ -127,6 +184,15 @@ class HttpSchemaTests(unittest.TestCase):
                 )
                 self.assertEqual(200, save_call.status_code)
                 self.assertFalse(save_call.json()["result"]["isError"])
+                failed_call = client.post(
+                    "/mcp", headers=headers,
+                    json={
+                        "jsonrpc": "2.0", "id": 5, "method": "tools/call",
+                        "params": {"name": "search_reflections", "arguments": {}},
+                    },
+                )
+                self.assertEqual(200, failed_call.status_code)
+                self.assertTrue(failed_call.json()["result"]["isError"])
 
 
 if __name__ == "__main__":

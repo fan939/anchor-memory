@@ -27,6 +27,7 @@ import chromadb
 from sentence_transformers import SentenceTransformer
 from datetime import datetime, timezone
 import os
+import uuid
 
 from anchor_db import AnchorDB
 
@@ -106,7 +107,10 @@ class AnchorMemory:
               epistemic_status: str = "reported", confidence: float = 0.5,
               source_turn: str = "", supersedes: str = "",
               memory_layer: str = "event", source_ref: str = "",
-              provenance: dict = None) -> str:
+              provenance: dict = None, salience: float = 0.5,
+              motifs: list = None, state: str = "active",
+              unresolved: bool = False, open_questions: list = None,
+              contradicted_by: list = None) -> str:
         """Store a memory with optional connections and emotion scoring.
 
         Args:
@@ -136,16 +140,35 @@ class AnchorMemory:
             raise ValueError("Memory text cannot be empty")
         if memory_layer not in {"core", "dynamic", "event"}:
             raise ValueError("memory_layer must be core, dynamic, or event")
+        if perspective not in {"user", "assistant", "joint", "external", "system", "mixed"}:
+            raise ValueError("unsupported perspective")
+        if epistemic_status not in {"reported", "observed", "hypothesis", "confirmed", "retracted"}:
+            raise ValueError("unsupported epistemic_status")
         if memory_layer == "core" and epistemic_status != "confirmed":
             raise ValueError("core memories require epistemic_status='confirmed'")
         if not 0.0 <= float(confidence) <= 1.0:
             raise ValueError("confidence must be between 0.0 and 1.0")
+        if not 0.0 <= float(emotion_score) <= 1.0:
+            raise ValueError("emotion_score must be between 0.0 and 1.0")
+        if not 0.0 <= float(salience) <= 1.0:
+            raise ValueError("salience must be between 0.0 and 1.0")
+        relationship_targets = list(connect_to or []) + list(contradicted_by or [])
+        if supersedes:
+            relationship_targets.append(supersedes)
+        missing_targets = sorted({
+            target_id for target_id in relationship_targets
+            if target_id != memory_id and not self.db.get(target_id)
+        })
+        if missing_targets:
+            raise ValueError(f"relationship target not found: {', '.join(missing_targets)}")
         embedding = self._embedder.encode(text).tolist()
         meta = {
             "memory_id": memory_id,
             "timestamp": datetime.now(timezone.utc).replace(tzinfo=None).isoformat(),
             "tag": tag,
             "memory_layer": memory_layer,
+            "salience": float(salience),
+            "state": state,
         }
         if source:
             meta["source"] = source
@@ -193,6 +216,8 @@ class AnchorMemory:
                 source_turn=source_turn, supersedes=supersedes,
                 memory_layer=memory_layer, source_ref=source_ref,
                 provenance=provenance or {},
+                salience=salience, motifs=motifs or [], state=state,
+                unresolved=unresolved, open_questions=open_questions or [],
             )
         except Exception:
             # Compensate a successful Chroma upsert when SQLite rejects/fails.
@@ -211,10 +236,12 @@ class AnchorMemory:
         # Create explicit connections
         if connect_to:
             for target_id in connect_to:
-                try:
-                    self.db.connect(memory_id, target_id)
-                except Exception:
-                    pass
+                self.db.connect(memory_id, target_id)
+
+        if supersedes:
+            self.db.connect(memory_id, supersedes, weight=2.0, relation="supersedes")
+        for target_id in (contradicted_by or []):
+            self.db.connect(memory_id, target_id, weight=1.0, relation="contradicts")
 
         # Eager concept-based linking for long/core memories (fire-and-forget).
         # Solves the cold-start edge problem: new memories get conceptual edges
@@ -233,22 +260,50 @@ class AnchorMemory:
         return memory_id
 
     def reconcile(self, repair: bool = False) -> dict:
-        """Compare SQLite and Chroma IDs; optionally repair safe orphans."""
-        sqlite_ids = {row["memory_id"] for row in self.db.list_all(limit=10**9)}
+        """Compare authoritative active SQLite rows and Chroma; optionally repair."""
+        sqlite_rows = self.db.list_all(limit=10**9)
+        sqlite_ids = {row["memory_id"] for row in sqlite_rows}
+        active_rows = {
+            row["memory_id"]: row for row in sqlite_rows
+            if row.get("epistemic_status") != "retracted" and row.get("state") != "superseded"
+        }
         raw = self._collection.get(include=[])
         chroma_ids = set(raw.get("ids", []))
         report = {
-            "sqlite_only": sorted(sqlite_ids - chroma_ids),
-            "chroma_only": sorted(chroma_ids - sqlite_ids),
+            "missing_vectors": sorted(set(active_rows) - chroma_ids),
+            "orphan_vectors": sorted(chroma_ids - sqlite_ids),
+            "audit_only_vectors": sorted((sqlite_ids - set(active_rows)) & chroma_ids),
             "repair": repair,
         }
+        # Backward-compatible names retained for operators/scripts upgrading
+        # from the original reconcile report.
+        report["sqlite_only"] = list(report["missing_vectors"])
+        report["chroma_only"] = list(report["orphan_vectors"])
         if repair:
-            # Chroma-only records have no authoritative metadata/text row and
-            # are safe to remove. SQLite-only records require re-embedding and
-            # are deliberately reported for an explicit rebuild operation.
-            if report["chroma_only"]:
-                self._collection.delete(ids=report["chroma_only"])
-            report["removed_chroma_orphans"] = len(report["chroma_only"])
+            remove_ids = report["orphan_vectors"] + report["audit_only_vectors"]
+            if remove_ids:
+                self._collection.delete(ids=remove_ids)
+            rebuilt = []
+            for memory_id in report["missing_vectors"]:
+                row = active_rows[memory_id]
+                if not hasattr(self._collection, "upsert") or not hasattr(self, "_embedder"):
+                    continue
+                self._collection.upsert(
+                    ids=[memory_id],
+                    embeddings=[self._embedder.encode(row["text"]).tolist()],
+                    documents=[row["text"]],
+                    metadatas=[{
+                        "memory_id": memory_id, "timestamp": row.get("timestamp", ""),
+                        "tag": row.get("tag", "general"),
+                        "memory_layer": row.get("memory_layer", "event"),
+                        "salience": float(row.get("salience", 0.5)),
+                        "state": row.get("state", "active"),
+                    }],
+                )
+                rebuilt.append(memory_id)
+            report["removed_vectors"] = remove_ids
+            report["rebuilt_vectors"] = rebuilt
+            report["removed_chroma_orphans"] = len(report["orphan_vectors"])
         return report
 
     def search(self, query: str, n_results: int = 5, tag: str = None,
@@ -303,21 +358,32 @@ class AnchorMemory:
                 continue
             mid = meta.get("memory_id", "unknown")
             ts = meta.get("timestamp", "")
+            row = self.db.get(mid)
+            if not row or row.get("epistemic_status") == "retracted" or row.get("state") == "superseded":
+                continue
             citation_boost = min(self.db.get_citation_count(mid) * 0.02, 0.15)
             emotion_boost = self.db.get_emotion_score(mid) * 0.1
             recency_boost = self._recency_boost(ts)
             feedback_penalty = self.db.get_feedback_penalty(mid)
-            boost = citation_boost + emotion_boost + recency_boost
+            salience_boost = float(row.get("salience", 0.5)) * 0.15
+            unresolved_boost = 0.04 if row.get("unresolved") else 0.0
+            state_adjustment = {
+                "active": 0.0, "resolved": 0.03, "weakened": 0.05,
+            }.get(row.get("state", "active"), 0.0)
+            boost = citation_boost + emotion_boost + recency_boost + salience_boost + unresolved_boost
             candidates.append({
                 "memory_id": mid,
                 "timestamp": ts,
                 "tag": meta.get("tag", "general"),
                 "snippet": doc,
-                "score": dist - boost + feedback_penalty,
+                "score": dist - boost + feedback_penalty + state_adjustment,
                 "_debug_raw_distance": dist,
                 "_debug_citation_boost": citation_boost,
                 "_debug_emotion_boost": emotion_boost,
                 "_debug_recency_boost": recency_boost,
+                "_debug_salience_boost": salience_boost,
+                "_debug_unresolved_boost": unresolved_boost,
+                "_debug_state_adjustment": state_adjustment,
                 "_debug_feedback_penalty": feedback_penalty,
                 "_debug_source": "vector",
             })
@@ -336,23 +402,38 @@ class AnchorMemory:
                 for nb in neighbors:
                     if nb["memory_id"] not in {x["memory_id"] for x in candidates + extra}:
                         row = self.db.get(nb["memory_id"])
-                        if row:
+                        if row and row.get("epistemic_status") != "retracted" and row.get("state") != "superseded":
                             feedback_penalty = self.db.get_feedback_penalty(nb["memory_id"])
+                            graph_boost = min(float(nb["weight"]) * 0.03, 0.2)
+                            salience_boost = float(row.get("salience", 0.5)) * 0.15
+                            unresolved_boost = 0.04 if row.get("unresolved") else 0.0
+                            recency_boost = self._recency_boost(row.get("timestamp", ""))
+                            state_adjustment = {
+                                "active": 0.0, "resolved": 0.03, "weakened": 0.05,
+                            }.get(row.get("state", "active"), 0.0)
                             extra.append({
                                 "memory_id": nb["memory_id"],
                                 "timestamp": row.get("timestamp", ""),
                                 "tag": row.get("tag", "general"),
                                 "snippet": row.get("text", ""),
-                                "score": c["score"] + 0.05 + feedback_penalty,
+                                "score": c["score"] + 0.05 + feedback_penalty + state_adjustment
+                                         - graph_boost - salience_boost - unresolved_boost - recency_boost,
                                 "via_association": True,
                                 "edge_weight": nb["weight"],
+                                "relation": nb.get("relation", "related"),
                                 "_debug_raw_distance": None,
                                 "_debug_citation_boost": 0.0,
                                 "_debug_emotion_boost": 0.0,
                                 "_debug_feedback_penalty": feedback_penalty,
+                                "_debug_salience_boost": salience_boost,
+                                "_debug_unresolved_boost": unresolved_boost,
+                                "_debug_recency_boost": recency_boost,
+                                "_debug_state_adjustment": state_adjustment,
+                                "_debug_graph_score": graph_boost,
                                 "_debug_source": "associative",
                                 "_debug_associated_from": c["memory_id"],
                                 "_debug_edge_weight": nb["weight"],
+                                "_debug_relation": nb.get("relation", "related"),
                             })
             candidates.extend(extra)
             candidates.sort(key=lambda m: m["score"])
@@ -384,12 +465,13 @@ class AnchorMemory:
             if row:
                 # Retraction preserves audit history but removes the record from
                 # ordinary recall. Exact get_memory remains available for audit.
-                if row.get("epistemic_status") == "retracted":
+                if row.get("epistemic_status") == "retracted" or row.get("state") == "superseded":
                     continue
                 for field in (
                     "perspective", "epistemic_status", "confidence",
                     "source_turn", "created_at", "updated_at", "supersedes",
                     "retracted_by", "memory_layer", "source_ref", "provenance",
+                    "salience", "motifs", "state", "unresolved", "open_questions",
                 ):
                     c[field] = row.get(field)
                 # Return interpretations beside their source event. This is a
@@ -399,22 +481,35 @@ class AnchorMemory:
                 )
             if debug:
                 c["debug"] = {
+                    "semantic_score": (
+                        None if c.get("_debug_raw_distance") is None
+                        else 1.0 - c.get("_debug_raw_distance")
+                    ),
                     "raw_distance": c.get("_debug_raw_distance"),
+                    "graph_link_score": c.get("_debug_graph_score", 0.0),
+                    "salience_boost": c.get("_debug_salience_boost", 0.0),
+                    "unresolved_boost": c.get("_debug_unresolved_boost", 0.0),
                     "citation_boost": c.get("_debug_citation_boost", 0.0),
                     "emotion_boost": c.get("_debug_emotion_boost", 0.0),
                     "recency_boost": c.get("_debug_recency_boost", 0.0),
-                    "feedback_penalty": c.get("_debug_feedback_penalty", 0.0),
+                    "feedback_adjustment": -c.get("_debug_feedback_penalty", 0.0),
+                    "state_adjustment": c.get("_debug_state_adjustment", 0.0),
                     "final_score": c.get("score"),
                     "source": c.get("_debug_source", "unknown"),
+                    "ranking_reason": "lower final_score ranks first after semantic, graph, salience, recency, emotion, citation, feedback, and state adjustments",
                 }
                 if c.get("_debug_associated_from"):
                     c["debug"]["associated_from"] = c["_debug_associated_from"]
                     c["debug"]["edge_weight"] = c.get("_debug_edge_weight")
+                    c["debug"]["relation"] = c.get("_debug_relation", "related")
             # Strip internal fields (whether debug or not) — cleaner output
             for k in ("_debug_raw_distance", "_debug_citation_boost",
                      "_debug_emotion_boost", "_debug_recency_boost",
+                     "_debug_salience_boost", "_debug_unresolved_boost",
+                     "_debug_state_adjustment", "_debug_graph_score",
                      "_debug_feedback_penalty", "_debug_source",
-                     "_debug_associated_from", "_debug_edge_weight"):
+                     "_debug_associated_from", "_debug_edge_weight",
+                     "_debug_relation"):
                 c.pop(k, None)
             seen.add(c["memory_id"])
             memories.append(c)
@@ -455,6 +550,8 @@ class AnchorMemory:
         clean_queries = [q.strip() for q in queries if q and q.strip()]
         if not clean_queries:
             return []
+        if len(clean_queries) > 3:
+            raise ValueError("search_multi accepts at most 3 targeted queries")
         if n_total is None:
             n_total = n_results_per_query * len(clean_queries)
 
@@ -489,18 +586,33 @@ class AnchorMemory:
     def _keyword_fallback(self, query: str, n_results: int = 5, tag: str = None) -> list:
         """SQLite LIKE fallback for cross-language embedding misses."""
         results = self.db.keyword_search(query, limit=n_results, tag=tag)
-        return [{
-            "memory_id": r["memory_id"],
-            "timestamp": r.get("timestamp", ""),
-            "tag": r.get("tag", "general"),
-            "snippet": r.get("text", ""),
-            "score": 0.6 + self.db.get_feedback_penalty(r["memory_id"]),
-            "_debug_raw_distance": None,
-            "_debug_citation_boost": 0.0,
-            "_debug_emotion_boost": 0.0,
-            "_debug_feedback_penalty": self.db.get_feedback_penalty(r["memory_id"]),
-            "_debug_source": "keyword",
-        } for r in results]
+        candidates = []
+        for row in results:
+            salience_boost = float(row.get("salience", 0.5)) * 0.15
+            unresolved_boost = 0.04 if row.get("unresolved") else 0.0
+            recency_boost = self._recency_boost(row.get("timestamp", ""))
+            feedback_penalty = self.db.get_feedback_penalty(row["memory_id"])
+            state_adjustment = {
+                "active": 0.0, "resolved": 0.03, "weakened": 0.05,
+            }.get(row.get("state", "active"), 0.0)
+            candidates.append({
+                "memory_id": row["memory_id"],
+                "timestamp": row.get("timestamp", ""),
+                "tag": row.get("tag", "general"),
+                "snippet": row.get("text", ""),
+                "score": 0.6 + feedback_penalty + state_adjustment
+                         - salience_boost - unresolved_boost - recency_boost,
+                "_debug_raw_distance": None,
+                "_debug_citation_boost": 0.0,
+                "_debug_emotion_boost": 0.0,
+                "_debug_recency_boost": recency_boost,
+                "_debug_salience_boost": salience_boost,
+                "_debug_unresolved_boost": unresolved_boost,
+                "_debug_state_adjustment": state_adjustment,
+                "_debug_feedback_penalty": feedback_penalty,
+                "_debug_source": "keyword",
+            })
+        return candidates
 
     def consolidate(self, conversation_text: str, top_n: int = 10) -> dict:
         """Passive Hebbian update — match conversation text against memory store,
@@ -564,8 +676,13 @@ class AnchorMemory:
 
     def delete(self, memory_id: str) -> bool:
         """Delete a memory and its edges."""
+        if not self.db.get(memory_id):
+            return False
+        previous_vector = self._collection.get(
+            ids=[memory_id], include=["embeddings", "documents", "metadatas"]
+        )
         try:
-            if self.db.get_reflections_for_event(memory_id, limit=1):
+            if self.db.get_reflections_for_event(memory_id, limit=1, include_abandoned=True):
                 raise ValueError(
                     "Cannot hard-delete an event referenced by a Reflection; "
                     "retract or supersede it instead"
@@ -576,7 +693,66 @@ class AnchorMemory:
         except ValueError:
             raise
         except Exception:
+            if previous_vector.get("ids"):
+                self._collection.upsert(
+                    ids=previous_vector["ids"], embeddings=previous_vector["embeddings"],
+                    documents=previous_vector["documents"],
+                    metadatas=previous_vector["metadatas"],
+                )
+            raise
+
+    def retract(self, memory_id: str, retracted_by: str = "") -> bool:
+        """Retract in SQLite and remove the searchable vector atomically enough to recover."""
+        row = self.db.get(memory_id)
+        if not row:
             return False
+        previous_vector = self._collection.get(
+            ids=[memory_id], include=["embeddings", "documents", "metadatas"]
+        )
+        try:
+            self._collection.delete(ids=[memory_id])
+            if not self.db.retract(memory_id, retracted_by):
+                raise RuntimeError("SQLite retraction did not update a row")
+            return True
+        except Exception:
+            if previous_vector.get("ids"):
+                self._collection.upsert(
+                    ids=previous_vector["ids"], embeddings=previous_vector["embeddings"],
+                    documents=previous_vector["documents"],
+                    metadatas=previous_vector["metadatas"],
+                )
+            raise
+
+    def update_recall_state(self, memory_id: str, salience: float = None,
+                            motifs: list = None, state: str = None,
+                            unresolved: bool = None,
+                            open_questions: list = None) -> dict:
+        """Synchronize recall-only state to SQLite and Chroma metadata."""
+        previous = self.db.get(memory_id)
+        if not previous:
+            raise ValueError(f"memory not found: {memory_id}")
+        updated = self.db.update_recall_state(
+            memory_id, salience=salience, motifs=motifs, state=state,
+            unresolved=unresolved, open_questions=open_questions,
+        )
+        try:
+            vector = self._collection.get(ids=[memory_id], include=["metadatas"])
+            if vector.get("ids"):
+                metadata = dict(vector["metadatas"][0] or {})
+                metadata.update({
+                    "salience": float(updated.get("salience", 0.5)),
+                    "state": updated.get("state", "active"),
+                })
+                self._collection.update(ids=[memory_id], metadatas=[metadata])
+            return updated
+        except Exception:
+            self.db.update_recall_state(
+                memory_id, salience=previous.get("salience"),
+                motifs=previous.get("motifs"), state=previous.get("state"),
+                unresolved=previous.get("unresolved"),
+                open_questions=previous.get("open_questions"),
+            )
+            raise
 
     def merge_memories(self, survivor_id: str, duplicate_id: str) -> dict:
         """Fold `duplicate_id` into `survivor_id`, then delete the duplicate
@@ -641,7 +817,10 @@ class AnchorMemory:
                    edge_decay_factor: float = 0.9,
                    strong_edge_decay_factor: float = 0.95,
                    emotion_nudge: float = 0.05,
-                   auto_discover: bool = True) -> dict:
+                   auto_discover: bool = True,
+                   dry_run: bool = False,
+                   maintenance_id: str = "",
+                   split_bundled: bool = False) -> dict:
         """Run memory consolidation — like sleep for the brain.
 
         - Decay short-tier memories older than N days
@@ -653,57 +832,99 @@ class AnchorMemory:
         Returns:
             Dict with counts of actions taken.
         """
-        results = {}
+        run_id = maintenance_id or f"dream_{uuid.uuid4().hex[:12]}"
+        existing_run = self.db.get_maintenance_run(run_id)
+        if existing_run:
+            return {"status": "already_recorded", "maintenance_run": existing_run}
 
-        # 1. Decay through the unified dual-store deletion path. Deleting only
-        # the SQLite row leaves an expired vector searchable in Chroma.
         expired_ids = self.db.get_expired_short_ids(days=short_decay_days)
-        deleted_ids = [memory_id for memory_id in expired_ids if self.delete(memory_id)]
-        results["decayed_memories"] = len(deleted_ids)
-        results["decay_failed"] = len(expired_ids) - len(deleted_ids)
-
-        # 2–3. Bucket edges by their pre-pass weight and decay each exactly once.
-        edge_stats = self.db.decay_edges_once(
+        edge_preview = self.db.preview_edge_decay(
             strong_threshold=1.5,
             weak_decay_factor=edge_decay_factor,
             strong_decay_factor=strong_edge_decay_factor,
             prune_below=0.1,
         )
-        results["pruned_edges"] = edge_stats["pruned"]
-        results["decayed_strong"] = edge_stats["strong_decayed"]
+        preview = {
+            "expired_memory_ids": expired_ids,
+            **edge_preview,
+            "auto_discover": auto_discover,
+            "emotion_equalization": self.emotion_equalization,
+            "split_bundled": split_bundled,
+        }
+        parameters = {
+            "short_decay_days": short_decay_days,
+            "edge_decay_factor": edge_decay_factor,
+            "strong_edge_decay_factor": strong_edge_decay_factor,
+            "emotion_nudge": emotion_nudge,
+            "auto_discover": auto_discover,
+            "split_bundled": split_bundled,
+        }
+        self.db.start_maintenance_run(run_id, "dream_pass", dry_run, parameters, preview)
+        if dry_run:
+            result = {"status": "preview", "run_id": run_id, "preview": preview}
+            self.db.finish_maintenance_run(run_id, "previewed", result)
+            return result
+
+        results = {"status": "complete", "run_id": run_id, "preview": preview}
+
+        try:
+
+        # 1. Decay through the unified dual-store deletion path. Deleting only
+        # the SQLite row leaves an expired vector searchable in Chroma.
+            deleted_ids = [memory_id for memory_id in expired_ids if self.delete(memory_id)]
+            results["decayed_memories"] = len(deleted_ids)
+            results["decay_failed"] = len(expired_ids) - len(deleted_ids)
+
+        # 2–3. Bucket edges by their pre-pass weight and decay each exactly once.
+            edge_stats = self.db.decay_edges_once(
+                strong_threshold=1.5,
+                weak_decay_factor=edge_decay_factor,
+                strong_decay_factor=strong_edge_decay_factor,
+                prune_below=0.1,
+            )
+            results["pruned_edges"] = edge_stats["pruned"]
+            results["decayed_strong"] = edge_stats["strong_decayed"]
 
         # 4. Auto-discover new connections
-        if auto_discover:
-            import random
-            try:
-                all_mems = self.db.list_all(limit=20, offset=random.randint(0, max(0, self.count() - 20)))
-                auto_connected = 0
-                for m in all_mems[:5]:
-                    neighbors = self.search(m["text"][:100], n_results=3, associate=False, hebbian=False)
-                    for nb in neighbors:
-                        if nb["memory_id"] != m["memory_id"]:
-                            existing = self.db.get_edge_weight(m["memory_id"], nb["memory_id"])
-                            if existing is None:
-                                self.db.connect(m["memory_id"], nb["memory_id"], weight=0.3)
-                                auto_connected += 1
-                results["auto_discovered"] = auto_connected
-            except Exception:
+            if auto_discover:
+                import random
+                try:
+                    all_mems = self.db.list_all(limit=20, offset=random.randint(0, max(0, self.count() - 20)))
+                    auto_connected = 0
+                    for m in all_mems[:5]:
+                        neighbors = self.search(m["text"][:100], n_results=3, associate=False, hebbian=False)
+                        for nb in neighbors:
+                            if nb["memory_id"] != m["memory_id"]:
+                                existing = self.db.get_edge_weight(m["memory_id"], nb["memory_id"])
+                                if existing is None:
+                                    self.db.connect(m["memory_id"], nb["memory_id"], weight=0.3)
+                                    auto_connected += 1
+                    results["auto_discovered"] = auto_connected
+                except Exception:
+                    results["auto_discovered"] = 0
+            else:
                 results["auto_discovered"] = 0
 
         # 5. Equilibrate emotion scores
-        results["emotion_equalized"] = (
-            self.db.equalize_emotion_scores(nudge=emotion_nudge, threshold=0.2)
-            if self.emotion_equalization else 0
-        )
+            results["emotion_equalized"] = (
+                self.db.equalize_emotion_scores(nudge=emotion_nudge, threshold=0.2)
+                if self.emotion_equalization else 0
+            )
 
         # 6. Split bundled memories (if LLM available)
-        try:
-            split_count = self.split_bundled(batch_size=50, dry_run=False)
-            results["split_memories"] = split_count
-        except Exception:
-            results["split_memories"] = 0
+            if split_bundled:
+                try:
+                    results["split_memories"] = self.split_bundled(batch_size=50, dry_run=False)
+                except Exception:
+                    results["split_memories"] = 0
+            else:
+                results["split_memories"] = 0
 
-        return results
+            self.db.finish_maintenance_run(run_id, "complete", results)
+            return results
+        except Exception as exc:
+            self.db.finish_maintenance_run(run_id, "failed", results, str(exc))
+            raise
 
     def split_bundled(self, batch_size: int = 50, dry_run: bool = False,
                       model: str = "claude-haiku-4-5-20251001") -> int:

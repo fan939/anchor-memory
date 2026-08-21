@@ -48,6 +48,20 @@ class McpReflectionTests(unittest.TestCase):
         self.assertFalse(by_name["save_reflection"]["annotations"]["readOnlyHint"])
         self.assertTrue(by_name["retract_reflection"]["annotations"]["destructiveHint"])
 
+    def test_schema_constraints_and_business_error_shape_are_advertised(self):
+        by_name = {tool["name"]: tool for tool in self.tools}
+        store = by_name["store_memory"]["inputSchema"]
+
+        self.assertEqual(["core", "dynamic", "event"], store["properties"]["memory_layer"]["enum"])
+        self.assertEqual(0.0, store["properties"]["salience"]["minimum"])
+        self.assertEqual(3, by_name["search_multi"]["inputSchema"]["properties"]["queries"]["maxItems"])
+        self.assertIn("get_links", by_name)
+        self.assertIn("update_memory_recall_state", by_name)
+
+        failed = self.handle("set_tier", {"memory_id": "missing", "tier": "long"})
+        self.assertFalse(failed["ok"])
+        self.assertEqual("not_found", failed["error"]["code"])
+
     def test_mcp_minimum_reflection_closure(self):
         draft_args = {
             "source_event_ids": ["event-mcp"],
