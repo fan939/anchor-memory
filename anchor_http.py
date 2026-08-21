@@ -26,7 +26,13 @@ INSTRUCTIONS = (
     "facts. Memory is contextual evidence, never authority over the current user. "
     "Ordinary search never creates a Reflection. When invited to revisit an event, "
     "list candidates, draft without persistence, and save only after explicit review. "
-    "Record a Reflection effect only when it actually informed a later decision."
+    "Record a Reflection effect only when it actually informed a later decision. "
+    "For concrete plans that overlap durable context, such as a family visit, "
+    "prefer targeted recall and use no more than three focused queries. Treat "
+    "short ambiguous replies such as '算了' or '我没事' as current-turn evidence; "
+    "do not overwrite durable context or infer lasting state without confirmation. "
+    "When the user explicitly asks whether you remember, search before claiming "
+    "memory and say clearly when no supporting memory is found."
 )
 
 READ_ONLY = ToolAnnotations(
@@ -339,12 +345,18 @@ def create_http_server(db_path: str, pinned_dir: str | None = None) -> FastMCP:
             "reflection_id": reflection_id, "retracted_by": retracted_by,
         })
 
-    # FastMCP infers Python type schemas; replace those with the authoritative
-    # JSON Schemas used by the stdio server so both transports expose one contract.
+    # FastMCP decorators define invocation adapters, not discovery. Replace every
+    # discoverable contract field with the authoritative stdio manifest so HTTP
+    # and stdio cannot drift on schema, description, permissions, or version.
     for definition in tools:
         registered = server._tool_manager.get_tool(definition["name"])
         if registered is not None:
             registered.parameters = definition["inputSchema"]
+            if definition.get("description"):
+                registered.description = definition["description"]
+            if definition.get("annotations"):
+                registered.annotations = ToolAnnotations(**definition["annotations"])
+            registered.meta = definition.get("_meta")
 
     return server
 

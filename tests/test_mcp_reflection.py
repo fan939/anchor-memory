@@ -6,7 +6,7 @@ import unittest
 from unittest.mock import patch
 
 from anchor_db import AnchorDB
-from anchor_mcp import create_server
+from anchor_mcp import TOOL_SCHEMA_META_KEY, TOOL_SCHEMA_VERSION, create_server
 
 
 PROVENANCE = {
@@ -53,6 +53,10 @@ class McpReflectionTests(unittest.TestCase):
 
     def test_schema_constraints_and_business_error_shape_are_advertised(self):
         by_name = {tool["name"]: tool for tool in self.tools}
+        self.assertEqual(
+            {TOOL_SCHEMA_VERSION},
+            {tool["_meta"][TOOL_SCHEMA_META_KEY] for tool in self.tools},
+        )
         store = by_name["store_memory"]["inputSchema"]
 
         self.assertEqual(["core", "dynamic", "event"], store["properties"]["memory_layer"]["enum"])

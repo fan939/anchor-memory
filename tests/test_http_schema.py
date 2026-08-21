@@ -1,8 +1,14 @@
 import asyncio
 import importlib.util
 import os
+import sys
+import tempfile
+import types
 import unittest
 from unittest.mock import patch
+
+from anchor_db import AnchorDB
+from anchor_mcp import create_server
 
 
 MCP_AVAILABLE = importlib.util.find_spec("mcp") is not None
@@ -21,6 +27,15 @@ class FakeCollection:
 class FakeMemory:
     db = FakeDB()
     _collection = FakeCollection()
+
+
+class ManifestMemory:
+    def __init__(self, db_path):
+        os.makedirs(db_path, exist_ok=True)
+        self.db = AnchorDB(os.path.join(db_path, "memories.db"))
+
+    def update_recall_state(self, memory_id, **metadata):
+        return self.db.update_recall_state(memory_id, **metadata)
 
 
 @unittest.skipUnless(MCP_AVAILABLE, "MCP SDK is only installed in the HTTP test environment")
@@ -103,9 +118,19 @@ class HttpSchemaTests(unittest.TestCase):
             "properties": {"text": {"type": "string", "minLength": 1}},
             "required": ["text"],
         }
+        description = "Authoritative description"
+        annotations = {
+            "readOnlyHint": False, "destructiveHint": False,
+            "idempotentHint": True, "openWorldHint": False,
+        }
+        meta = {"anchor/schema_version": "test-version"}
 
         def fake_create_server(db_path, pinned_dir=None):
-            return ([{"name": "store_memory", "inputSchema": authoritative}],
+            return ([{
+                        "name": "store_memory", "inputSchema": authoritative,
+                        "description": description, "annotations": annotations,
+                        "_meta": meta,
+                    }],
                     lambda name, payload: {"tool": name}, FakeMemory())
 
         with patch.object(anchor_http, "create_server", fake_create_server):
@@ -113,6 +138,40 @@ class HttpSchemaTests(unittest.TestCase):
             by_name = {tool.name: tool for tool in asyncio.run(server.list_tools())}
 
         self.assertEqual(authoritative, by_name["store_memory"].inputSchema)
+        self.assertEqual(description, by_name["store_memory"].description)
+        self.assertTrue(by_name["store_memory"].annotations.idempotentHint)
+        self.assertEqual(meta, by_name["store_memory"].meta)
+
+    def test_every_http_tool_uses_the_stdio_discovery_contract(self):
+        import anchor_http
+
+        fake_module = types.ModuleType("anchor_memory")
+        fake_module.AnchorMemory = ManifestMemory
+        with tempfile.TemporaryDirectory() as tempdir, patch.dict(
+            sys.modules, {"anchor_memory": fake_module}
+        ):
+            raw_tools, handle, memory = create_server(tempdir)
+            with patch.object(
+                anchor_http, "create_server",
+                return_value=(raw_tools, handle, memory),
+            ):
+                server = anchor_http.create_http_server(tempdir)
+                http_tools = asyncio.run(server.list_tools())
+
+        raw_by_name = {tool["name"]: tool for tool in raw_tools}
+        http_by_name = {tool.name: tool for tool in http_tools}
+        # HTTP intentionally exposes a safer remote subset of legacy stdio
+        # maintenance tools. Every remote tool must still come from the raw
+        # authoritative manifest and match it field-for-field.
+        self.assertTrue(set(http_by_name).issubset(raw_by_name))
+        self.assertIn("wakeup", http_by_name)
+        for name, exposed in http_by_name.items():
+            raw = raw_by_name[name]
+            self.assertEqual(raw["description"], exposed.description, name)
+            self.assertEqual(raw["inputSchema"], exposed.inputSchema, name)
+            self.assertEqual(raw["_meta"], exposed.meta, name)
+            for hint, expected in raw["annotations"].items():
+                self.assertEqual(expected, getattr(exposed.annotations, hint), name)
 
     def test_streamable_http_protocol_health_and_auth(self):
         import anchor_http

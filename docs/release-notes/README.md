@@ -2,6 +2,10 @@
 
 Most recent first. Each note follows the same shape: what changed, why it matters, what to do about it.
 
+- [v1.14.1](v1.14.1.md) — 2026-08-21 · versioned authoritative tool discovery · recall regression cases
+- [v1.14](v1.14.md) — 2026-08-21 · salient recall · safe maintenance · metadata and graph observability
+- [v1.13](v1.13.md) — 2026-08-20 · production OAuth and remote MCP hardening
+- [v1.12](v1.12.md) — 2026-08-20 · schema and reflection transport fixes
 - [v1.10](v1.10.md) — 2026-06-17 · UPSERT insert + self-loop guard (bug fixes) · recency boost · dedup merge
 - [v1.9.1](v1.9.1.md) — 2026-05-24
 - [v1.9](v1.9.md) — 2026-05-23 · multi-provider LLM abstraction (BYO LLM)

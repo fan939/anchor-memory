@@ -29,6 +29,11 @@ sys.path.insert(0, os.path.dirname(__file__))
 import anchor_pinned
 
 
+SERVER_VERSION = "1.14.1"
+TOOL_SCHEMA_VERSION = "1.2"
+TOOL_SCHEMA_META_KEY = "anchor/schema_version"
+
+
 def create_server(db_path: str = "./anchor_data", pinned_dir: str = None):
     """Create MCP server with Anchor Memory tools.
 
@@ -764,7 +769,12 @@ def create_server(db_path: str = "./anchor_data", pinned_dir: str = None):
     destructive_tools = {
         "delete_memory", "dream_pass", "retract_memory", "retract_reflection",
     }
-    idempotent_tools = {"get_memory", "get_neighbors", "get_annotations", "wakeup", "search_annotations", "list_reflection_candidates", "draft_reflection", "search_reflections", "graph_stats", "get_comments"}
+    idempotent_tools = {
+        "get_memory", "get_neighbors", "get_annotations", "wakeup",
+        "search_annotations", "list_reflection_candidates", "draft_reflection",
+        "search_reflections", "graph_stats", "get_comments", "get_links",
+        "pin_memory", "unpin_memory",
+    }
     for tool in TOOLS:
         name = tool["name"]
         tool["annotations"] = {
@@ -773,6 +783,9 @@ def create_server(db_path: str = "./anchor_data", pinned_dir: str = None):
             "idempotentHint": name in idempotent_tools,
             "openWorldHint": False,
         }
+        # This raw definition is the discovery contract for every transport.
+        # Clients can use the version to invalidate a cached tool snapshot.
+        tool["_meta"] = {TOOL_SCHEMA_META_KEY: TOOL_SCHEMA_VERSION}
 
     def handle_tool(name: str, args: dict) -> dict:
         """Execute a tool and return result."""
@@ -1114,7 +1127,7 @@ def run_stdio(db_path: str, pinned_dir: str = None):
                     "capabilities": {"tools": {}},
                     "serverInfo": {
                         "name": "anchor-memory",
-                        "version": "1.14",
+                        "version": SERVER_VERSION,
                     }
                 }
             })
