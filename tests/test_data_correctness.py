@@ -667,17 +667,24 @@ class DataCorrectnessTests(unittest.TestCase):
         self.assertEqual("reported", row["epistemic_status"])
         self.assertEqual("turn:10", row["source_ref"])
 
-    def test_only_confirmed_core_can_be_pinned(self):
+    def test_pin_changes_recall_priority_without_changing_truth_status(self):
         self.db.insert("event", "ordinary evidence")
-        with self.assertRaisesRegex(ValueError, "only confirmed core"):
-            self.db.pin("event")
+        self.db.pin("event")
+        event = self.db.get("event")
+        self.assertEqual("event", event["memory_layer"])
+        self.assertEqual("reported", event["epistemic_status"])
+        self.assertEqual(["event"], [row["memory_id"] for row in self.db.get_pinned()])
 
-        self.db.insert(
-            "core", "explicitly confirmed", memory_layer="core",
-            epistemic_status="confirmed",
-        )
-        self.db.pin("core")
-        self.assertEqual(["core"], [row["memory_id"] for row in self.db.get_pinned()])
+    def test_retracted_or_superseded_memory_cannot_be_pinned(self):
+        self.db.insert("retracted", "old event")
+        self.db.retract("retracted", "test")
+        with self.assertRaisesRegex(ValueError, "cannot be pinned"):
+            self.db.pin("retracted")
+
+        self.db.insert("superseded", "old conclusion")
+        self.db.update_recall_state("superseded", state="superseded")
+        with self.assertRaisesRegex(ValueError, "cannot be pinned"):
+            self.db.pin("superseded")
 
     def test_feedback_is_append_only_bounded_and_never_deletes_memory(self):
         self.db.insert("feedback-target", "durable event")

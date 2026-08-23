@@ -1834,15 +1834,14 @@ class AnchorDB:
     def pin(self, memory_id: str):
         with self._conn() as conn:
             row = conn.execute(
-                "SELECT memory_layer, epistemic_status FROM memories WHERE memory_id = ?",
+                "SELECT epistemic_status, state FROM memories WHERE memory_id = ?",
                 (memory_id,),
             ).fetchone()
             if row is None:
                 raise ValueError(f"memory not found: {memory_id}")
-            if row["memory_layer"] != "core" or row["epistemic_status"] != "confirmed":
+            if row["epistemic_status"] == "retracted" or row["state"] == "superseded":
                 raise ValueError(
-                    "only confirmed core memories can be pinned; explicitly confirm "
-                    "and store the core memory before pinning"
+                    "retracted or superseded memories cannot be pinned"
                 )
             conn.execute("UPDATE memories SET pinned = 1 WHERE memory_id = ?", (memory_id,))
             conn.commit()
@@ -1857,7 +1856,9 @@ class AnchorDB:
     def get_pinned(self) -> list:
         with self._conn() as conn:
             rows = conn.execute(
-                "SELECT memory_id, text, timestamp, tag FROM memories WHERE pinned = 1"
+                "SELECT memory_id, text, timestamp, tag FROM memories "
+                "WHERE pinned = 1 AND epistemic_status != 'retracted' "
+                "AND state != 'superseded'"
             ).fetchall()
         return [dict(r) for r in rows]
 
