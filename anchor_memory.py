@@ -315,6 +315,30 @@ class AnchorMemory:
             "repair": repair,
         }
         report["repair_pending_count"] = len(report["repair_operations"])
+        report["repair_preview"] = {
+            "rebuild_vectors": [
+                {"memory_id": memory_id, "reason": "active SQLite memory has no vector"}
+                for memory_id in report["missing_vectors"]
+            ],
+            "remove_vectors": [
+                {"memory_id": memory_id, "reason": "vector has no SQLite record"}
+                for memory_id in report["orphan_vectors"]
+            ] + [
+                {"memory_id": memory_id, "reason": "retracted or superseded SQLite record is audit-only"}
+                for memory_id in report["audit_only_vectors"]
+            ],
+            "review_operations": [
+                {
+                    "op_id": item["op_id"], "op_type": item["op_type"],
+                    "memory_id": item["memory_id"], "status": item["status"],
+                    "sqlite_state": item["sqlite_state"], "vector_state": item["vector_state"],
+                }
+                for item in report["repair_operations"]
+            ],
+            "apply_requires_backup": bool(
+                report["orphan_vectors"] or report["audit_only_vectors"] or report["repair_operations"]
+            ),
+        }
         # Backward-compatible names retained for operators/scripts upgrading
         # from the original reconcile report.
         report["sqlite_only"] = list(report["missing_vectors"])
@@ -714,8 +738,10 @@ class AnchorMemory:
             "new_connections": new_connections,
         }
 
-    def delete(self, memory_id: str) -> bool:
+    def delete(self, memory_id: str, *, operation: str = "delete") -> bool:
         """Delete a memory and its edges."""
+        if operation not in {"delete", "expire"}:
+            raise ValueError("operation must be delete or expire")
         if not self.db.get(memory_id):
             return False
         if self.db.get_reflections_for_event(memory_id, limit=1, include_abandoned=True):
@@ -726,12 +752,12 @@ class AnchorMemory:
         previous_vector = self._collection.get(
             ids=[memory_id], include=["embeddings", "documents", "metadatas"]
         )
-        repair_op_id = f"delete_{uuid.uuid4().hex}"
+        repair_op_id = f"{operation}_{uuid.uuid4().hex}"
         journal_start = getattr(self.db, "start_repair_operation", None)
         journal_update = getattr(self.db, "update_repair_operation", None)
         if journal_start:
             journal_start(
-                repair_op_id, "delete", memory_id=memory_id,
+                repair_op_id, operation, memory_id=memory_id,
                 intended_state={"memory_id": memory_id, "vector_present": bool(previous_vector.get("ids"))},
             )
         try:
@@ -771,18 +797,47 @@ class AnchorMemory:
         previous_vector = self._collection.get(
             ids=[memory_id], include=["embeddings", "documents", "metadatas"]
         )
+        repair_op_id = f"retract_{uuid.uuid4().hex}"
+        journal_start = getattr(self.db, "start_repair_operation", None)
+        journal_update = getattr(self.db, "update_repair_operation", None)
+        if journal_start:
+            journal_start(
+                repair_op_id, "retract", memory_id=memory_id,
+                intended_state={
+                    "memory_id": memory_id,
+                    "retracted_by": retracted_by,
+                    "vector_present": bool(previous_vector.get("ids")),
+                },
+            )
         try:
             self._collection.delete(ids=[memory_id])
+            if journal_update:
+                journal_update(repair_op_id, vector_state="applied")
             if not self.db.retract(memory_id, retracted_by):
                 raise RuntimeError("SQLite retraction did not update a row")
-            return True
-        except Exception:
-            if previous_vector.get("ids"):
-                self._collection.upsert(
-                    ids=previous_vector["ids"], embeddings=previous_vector["embeddings"],
-                    documents=previous_vector["documents"],
-                    metadatas=previous_vector["metadatas"],
+            if journal_update:
+                journal_update(
+                    repair_op_id, sqlite_state="applied", vector_state="applied", status="applied"
                 )
+            return True
+        except Exception as exc:
+            rolled_back = False
+            try:
+                if previous_vector.get("ids"):
+                    self._collection.upsert(
+                        ids=previous_vector["ids"], embeddings=previous_vector["embeddings"],
+                        documents=previous_vector["documents"],
+                        metadatas=previous_vector["metadatas"],
+                    )
+                rolled_back = True
+            finally:
+                if journal_update:
+                    journal_update(
+                        repair_op_id, sqlite_state="failed",
+                        vector_state="rolled_back" if rolled_back else "needs_repair",
+                        status="rolled_back" if rolled_back else "needs_repair",
+                        error=f"{type(exc).__name__}: {exc}",
+                    )
             raise
 
     def update_recall_state(self, memory_id: str, salience: float = None,
@@ -1023,7 +1078,10 @@ class AnchorMemory:
 
         # 1. Decay through the unified dual-store deletion path. Deleting only
         # the SQLite row leaves an expired vector searchable in Chroma.
-            deleted_ids = [memory_id for memory_id in expired_ids if self.delete(memory_id)]
+            deleted_ids = [
+                memory_id for memory_id in expired_ids
+                if self.delete(memory_id, operation="expire")
+            ]
             results["decayed_memories"] = len(deleted_ids)
             results["decay_failed"] = len(expired_ids) - len(deleted_ids)
 

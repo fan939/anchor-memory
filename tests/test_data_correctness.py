@@ -122,6 +122,9 @@ class DataCorrectnessTests(unittest.TestCase):
         self.assertEqual(0, result["decay_failed"])
         self.assertIsNone(self.db.get("expired"))
         self.assertNotIn("expired", memory._collection.ids)
+        operations = self.db.list_repair_operations(("applied",))
+        self.assertEqual("expire", operations[0]["op_type"])
+        self.assertEqual("expired", operations[0]["memory_id"])
 
     def test_weak_and_strong_edges_decay_once(self):
         for memory_id in ("a", "b", "c"):
@@ -443,6 +446,8 @@ class DataCorrectnessTests(unittest.TestCase):
 
         self.assertNotIn("same", memory._collection.records)
         self.assertEqual("retracted", self.db.get("same")["epistemic_status"])
+        operation = self.db.list_repair_operations(("applied",))[0]
+        self.assertEqual("retract", operation["op_type"])
 
     def test_reconcile_reports_and_removes_only_chroma_orphans(self):
         self.db.insert("sqlite-only", "needs re-embedding")
@@ -472,6 +477,28 @@ class DataCorrectnessTests(unittest.TestCase):
 
         self.assertEqual(1, report["repair_pending_count"])
         self.assertEqual("pending-store", report["repair_operations"][0]["op_id"])
+        self.assertEqual(
+            "pending-store", report["repair_preview"]["review_operations"][0]["op_id"]
+        )
+        self.assertTrue(report["repair_preview"]["apply_requires_backup"])
+
+    def test_reconcile_preview_distinguishes_rebuild_from_destructive_vector_cleanup(self):
+        self.db.insert("sqlite-only", "needs a vector")
+        memory = AnchorMemory.__new__(AnchorMemory)
+        memory.db = self.db
+        memory._collection = FakeCollection(["chroma-only"])
+
+        report = AnchorMemory.reconcile(memory)
+
+        self.assertEqual(
+            ["sqlite-only"],
+            [item["memory_id"] for item in report["repair_preview"]["rebuild_vectors"]],
+        )
+        self.assertEqual(
+            ["chroma-only"],
+            [item["memory_id"] for item in report["repair_preview"]["remove_vectors"]],
+        )
+        self.assertTrue(report["repair_preview"]["apply_requires_backup"])
 
     def test_legacy_continuity_header_is_neutralized_without_losing_body(self):
         pinned = os.path.join(self.tempdir.name, "pinned")
