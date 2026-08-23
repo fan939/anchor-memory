@@ -521,6 +521,22 @@ class DataCorrectnessTests(unittest.TestCase):
         self.assertNotIn("SQLite authority", str(report))
         self.assertNotIn("stale vector document", str(report))
 
+    def test_reconcile_apply_journals_vector_rebuild(self):
+        self.db.insert("sqlite-only", "needs re-embedding")
+        vector_store = FakeVectorStore()
+        memory = AnchorMemory.__new__(AnchorMemory)
+        memory.db = self.db
+        memory._vector_store = vector_store
+        memory._embedder = FakeEmbedder()
+
+        report = AnchorMemory.reconcile(memory, repair=True)
+
+        self.assertEqual(["sqlite-only"], report["rebuilt_vectors"])
+        operation = self.db.list_repair_operations(("applied",))[0]
+        self.assertEqual("reconcile", operation["op_type"])
+        self.assertEqual("sqlite-only", operation["memory_id"])
+        self.assertEqual("applied", operation["vector_state"])
+
     def test_legacy_continuity_header_is_neutralized_without_losing_body(self):
         pinned = os.path.join(self.tempdir.name, "pinned")
         write_session_state(pinned, LEGACY_CONTINUITY_HEADER + "\n\nbody stays")

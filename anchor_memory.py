@@ -376,28 +376,57 @@ class AnchorMemory:
         report["chroma_only"] = list(report["orphan_vectors"])
         if repair:
             remove_ids = report["orphan_vectors"] + report["audit_only_vectors"]
-            if remove_ids:
-                self._vectors().delete(ids=remove_ids)
+            journal_start = getattr(self.db, "start_repair_operation", None)
+            journal_update = getattr(self.db, "update_repair_operation", None)
+
+            def repair_vector(operation: str, memory_id: str, action):
+                """Journal an authority-preserving vector repair before mutating it."""
+                op_id = f"reconcile_{operation}_{uuid.uuid4().hex}"
+                if journal_start:
+                    journal_start(
+                        op_id, "reconcile", memory_id=memory_id,
+                        intended_state={"action": operation, "memory_id": memory_id},
+                    )
+                try:
+                    action()
+                except Exception as exc:
+                    if journal_update:
+                        journal_update(
+                            op_id, sqlite_state="not_needed", vector_state="needs_repair",
+                            status="needs_repair", error=f"{type(exc).__name__}: {exc}",
+                        )
+                    raise
+                if journal_update:
+                    journal_update(
+                        op_id, sqlite_state="not_needed", vector_state="applied", status="applied",
+                    )
+
+            for memory_id in remove_ids:
+                repair_vector("remove_vector", memory_id,
+                              lambda memory_id=memory_id: self._vectors().delete(ids=[memory_id]))
             rebuilt = []
             rebuild_ids = report["missing_vectors"] + [
                 item["memory_id"] for item in report["mismatched_vectors"]
             ]
             for memory_id in rebuild_ids:
                 row = active_rows[memory_id]
-                if not hasattr(self._collection, "upsert") or not hasattr(self, "_embedder"):
+                if not hasattr(self, "_embedder"):
                     continue
-                self._vectors().upsert(
-                    ids=[memory_id],
-                    embeddings=[self._embedder.encode(row["text"]).tolist()],
-                    documents=[row["text"]],
-                    metadatas=[{
-                        "memory_id": memory_id, "timestamp": row.get("timestamp", ""),
-                        "tag": row.get("tag", "general"),
-                        "memory_layer": row.get("memory_layer", "event"),
-                        "salience": float(row.get("salience", 0.5)),
-                        "state": row.get("state", "active"),
-                        "text_sha256": hashlib.sha256(row["text"].encode("utf-8")).hexdigest(),
-                    }],
+                repair_vector(
+                    "rebuild_vector", memory_id,
+                    lambda memory_id=memory_id, row=row: self._vectors().upsert(
+                        ids=[memory_id],
+                        embeddings=[self._embedder.encode(row["text"]).tolist()],
+                        documents=[row["text"]],
+                        metadatas=[{
+                            "memory_id": memory_id, "timestamp": row.get("timestamp", ""),
+                            "tag": row.get("tag", "general"),
+                            "memory_layer": row.get("memory_layer", "event"),
+                            "salience": float(row.get("salience", 0.5)),
+                            "state": row.get("state", "active"),
+                            "text_sha256": hashlib.sha256(row["text"].encode("utf-8")).hexdigest(),
+                        }],
+                    ),
                 )
                 rebuilt.append(memory_id)
             report["removed_vectors"] = remove_ids
