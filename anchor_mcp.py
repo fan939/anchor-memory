@@ -30,7 +30,7 @@ import anchor_pinned
 
 
 SERVER_VERSION = "1.15.1"
-TOOL_SCHEMA_VERSION = "1.4"
+TOOL_SCHEMA_VERSION = "1.5"
 TOOL_SCHEMA_META_KEY = "anchor/schema_version"
 
 
@@ -485,7 +485,7 @@ def create_server(db_path: str = "./anchor_data", pinned_dir: str = None):
         },
         {
             "name": "pin_memory",
-            "description": "Pin an explicitly confirmed core memory for wakeup(). Event-layer or unconfirmed memories are rejected.",
+            "description": "Pin any active memory for wakeup() recall priority only. Pinning never changes epistemic status or memory layer; retracted or superseded memories are rejected.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
