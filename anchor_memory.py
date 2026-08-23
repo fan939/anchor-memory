@@ -28,6 +28,7 @@ from sentence_transformers import SentenceTransformer
 from datetime import datetime, timezone
 import os
 import uuid
+import hashlib
 
 from anchor_db import AnchorDB
 
@@ -162,6 +163,17 @@ class AnchorMemory:
         if missing_targets:
             raise ValueError(f"relationship target not found: {', '.join(missing_targets)}")
         embedding = self._embedder.encode(text).tolist()
+        repair_op_id = f"store_{uuid.uuid4().hex}"
+        journal_start = getattr(self.db, "start_repair_operation", None)
+        journal_update = getattr(self.db, "update_repair_operation", None)
+        if journal_start:
+            journal_start(
+                repair_op_id, "store", memory_id=memory_id,
+                intended_state={
+                    "memory_id": memory_id,
+                    "text_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+                },
+            )
         meta = {
             "memory_id": memory_id,
             "timestamp": datetime.now(timezone.utc).replace(tzinfo=None).isoformat(),
@@ -179,12 +191,22 @@ class AnchorMemory:
             ids=[memory_id], include=["embeddings", "documents", "metadatas"]
         )
 
-        self._collection.upsert(
-            ids=[memory_id],
-            embeddings=[embedding],
-            documents=[text],
-            metadatas=[meta],
-        )
+        try:
+            self._collection.upsert(
+                ids=[memory_id],
+                embeddings=[embedding],
+                documents=[text],
+                metadatas=[meta],
+            )
+        except Exception as exc:
+            if journal_update:
+                journal_update(
+                    repair_op_id, sqlite_state="not_needed", vector_state="needs_repair",
+                    status="needs_repair", error=f"{type(exc).__name__}: {exc}",
+                )
+            raise
+        if journal_update:
+            journal_update(repair_op_id, vector_state="applied")
 
         # Emotion score propagation: if default, check nearest neighbors
         if emotion_score == 0.5:
@@ -219,19 +241,35 @@ class AnchorMemory:
                 salience=salience, motifs=motifs or [], state=state,
                 unresolved=unresolved, open_questions=open_questions or [],
             )
-        except Exception:
+        except Exception as exc:
             # Compensate a successful Chroma upsert when SQLite rejects/fails.
             # Restore an existing vector exactly; remove only genuinely new IDs.
-            if previous_vector.get("ids"):
-                self._collection.upsert(
-                    ids=previous_vector["ids"],
-                    embeddings=previous_vector["embeddings"],
-                    documents=previous_vector["documents"],
-                    metadatas=previous_vector["metadatas"],
-                )
-            else:
-                self._collection.delete(ids=[memory_id])
+            rolled_back = False
+            try:
+                if previous_vector.get("ids"):
+                    self._collection.upsert(
+                        ids=previous_vector["ids"],
+                        embeddings=previous_vector["embeddings"],
+                        documents=previous_vector["documents"],
+                        metadatas=previous_vector["metadatas"],
+                    )
+                else:
+                    self._collection.delete(ids=[memory_id])
+                rolled_back = True
+            finally:
+                if journal_update:
+                    journal_update(
+                        repair_op_id,
+                        sqlite_state="failed",
+                        vector_state="rolled_back" if rolled_back else "needs_repair",
+                        status="rolled_back" if rolled_back else "needs_repair",
+                        error=f"{type(exc).__name__}: {exc}",
+                    )
             raise
+        if journal_update:
+            journal_update(
+                repair_op_id, sqlite_state="applied", vector_state="applied", status="applied"
+            )
 
         # Create explicit connections
         if connect_to:
@@ -273,8 +311,10 @@ class AnchorMemory:
             "missing_vectors": sorted(set(active_rows) - chroma_ids),
             "orphan_vectors": sorted(chroma_ids - sqlite_ids),
             "audit_only_vectors": sorted((sqlite_ids - set(active_rows)) & chroma_ids),
+            "repair_operations": self.db.list_repair_operations(),
             "repair": repair,
         }
+        report["repair_pending_count"] = len(report["repair_operations"])
         # Backward-compatible names retained for operators/scripts upgrading
         # from the original reconcile report.
         report["sqlite_only"] = list(report["missing_vectors"])
@@ -678,27 +718,49 @@ class AnchorMemory:
         """Delete a memory and its edges."""
         if not self.db.get(memory_id):
             return False
+        if self.db.get_reflections_for_event(memory_id, limit=1, include_abandoned=True):
+            raise ValueError(
+                "Cannot hard-delete an event referenced by a Reflection; "
+                "retract or supersede it instead"
+            )
         previous_vector = self._collection.get(
             ids=[memory_id], include=["embeddings", "documents", "metadatas"]
         )
+        repair_op_id = f"delete_{uuid.uuid4().hex}"
+        journal_start = getattr(self.db, "start_repair_operation", None)
+        journal_update = getattr(self.db, "update_repair_operation", None)
+        if journal_start:
+            journal_start(
+                repair_op_id, "delete", memory_id=memory_id,
+                intended_state={"memory_id": memory_id, "vector_present": bool(previous_vector.get("ids"))},
+            )
         try:
-            if self.db.get_reflections_for_event(memory_id, limit=1, include_abandoned=True):
-                raise ValueError(
-                    "Cannot hard-delete an event referenced by a Reflection; "
-                    "retract or supersede it instead"
-                )
             self._collection.delete(ids=[memory_id])
+            if journal_update:
+                journal_update(repair_op_id, vector_state="applied")
             self.db.delete(memory_id)
-            return True
-        except ValueError:
-            raise
-        except Exception:
-            if previous_vector.get("ids"):
-                self._collection.upsert(
-                    ids=previous_vector["ids"], embeddings=previous_vector["embeddings"],
-                    documents=previous_vector["documents"],
-                    metadatas=previous_vector["metadatas"],
+            if journal_update:
+                journal_update(
+                    repair_op_id, sqlite_state="applied", vector_state="applied", status="applied"
                 )
+            return True
+        except Exception as exc:
+            rolled_back = False
+            try:
+                if previous_vector.get("ids"):
+                    self._collection.upsert(
+                        ids=previous_vector["ids"], embeddings=previous_vector["embeddings"],
+                        documents=previous_vector["documents"], metadatas=previous_vector["metadatas"],
+                    )
+                rolled_back = True
+            finally:
+                if journal_update:
+                    journal_update(
+                        repair_op_id, sqlite_state="failed",
+                        vector_state="rolled_back" if rolled_back else "needs_repair",
+                        status="rolled_back" if rolled_back else "needs_repair",
+                        error=f"{type(exc).__name__}: {exc}",
+                    )
             raise
 
     def retract(self, memory_id: str, retracted_by: str = "") -> bool:
@@ -849,25 +911,53 @@ class AnchorMemory:
         d_emo = d.get("emotion_score") if d.get("emotion_score") is not None else 0.5
         new_emo = max(s_emo, d_emo)
 
-        edges_migrated = self.db.migrate_edges(duplicate_id, survivor_id)
-
-        with self.db._conn() as conn:
-            conn.execute(
-                "UPDATE memories SET usage_count = ?, timestamp = ?, pinned = ?, emotion_score = ? "
-                "WHERE memory_id = ?",
-                (new_usage, new_ts, new_pinned, new_emo, survivor_id),
-            )
-            conn.commit()
-
-        deleted = self.delete(duplicate_id)  # both stores (SQLite row + vector)
-        self.db.log_event(
-            survivor_id, "merged",
-            f"from={duplicate_id} edges_migrated={edges_migrated} "
-            f"usage={new_usage} ts={new_ts} pinned={new_pinned} emotion={new_emo:.2f}",
+        previous_vector = self._collection.get(
+            ids=[duplicate_id], include=["embeddings", "documents", "metadatas"]
         )
+        repair_op_id = f"merge_{uuid.uuid4().hex}"
+        journal_start = getattr(self.db, "start_repair_operation", None)
+        journal_update = getattr(self.db, "update_repair_operation", None)
+        if journal_start:
+            journal_start(
+                repair_op_id, "merge", memory_id=survivor_id, related_ids=[duplicate_id],
+                intended_state={
+                    "survivor_id": survivor_id, "duplicate_id": duplicate_id,
+                    "duplicate_vector_present": bool(previous_vector.get("ids")),
+                },
+            )
+        try:
+            self._collection.delete(ids=[duplicate_id])
+            if journal_update:
+                journal_update(repair_op_id, vector_state="applied")
+            edges_migrated = self.db.merge_duplicate_into(
+                survivor_id, duplicate_id, usage_count=new_usage, timestamp=new_ts,
+                pinned=new_pinned, emotion_score=new_emo,
+            )
+            if journal_update:
+                journal_update(
+                    repair_op_id, sqlite_state="applied", vector_state="applied", status="applied"
+                )
+        except Exception as exc:
+            rolled_back = False
+            try:
+                if previous_vector.get("ids"):
+                    self._collection.upsert(
+                        ids=previous_vector["ids"], embeddings=previous_vector["embeddings"],
+                        documents=previous_vector["documents"], metadatas=previous_vector["metadatas"],
+                    )
+                rolled_back = True
+            finally:
+                if journal_update:
+                    journal_update(
+                        repair_op_id, sqlite_state="failed",
+                        vector_state="rolled_back" if rolled_back else "needs_repair",
+                        status="rolled_back" if rolled_back else "needs_repair",
+                        error=f"{type(exc).__name__}: {exc}",
+                    )
+            raise
         return {
             "survivor": survivor_id,
-            "duplicate_deleted": deleted,
+            "duplicate_deleted": True,
             "edges_migrated": edges_migrated,
             "usage_count": new_usage,
             "timestamp": new_ts,

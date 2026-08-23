@@ -161,6 +161,23 @@ class DataCorrectnessTests(unittest.TestCase):
         self.assertEqual(["choice", "response"], row["motifs"])
         self.assertTrue(row["unresolved"])
 
+    def test_repair_journal_is_persistent_and_contains_only_recovery_metadata(self):
+        started = self.db.start_repair_operation(
+            "store-fixture", "store", memory_id="fixture",
+            intended_state={"memory_id": "fixture", "text_sha256": "abc123"},
+        )
+        self.assertEqual("pending", started["status"])
+        self.assertEqual("pending", started["sqlite_state"])
+        self.assertEqual("abc123", started["intended_state"]["text_sha256"])
+
+        updated = self.db.update_repair_operation(
+            "store-fixture", sqlite_state="applied", vector_state="failed",
+            status="needs_repair", error="injected vector failure",
+        )
+        self.assertEqual("needs_repair", updated["status"])
+        self.assertEqual("failed", updated["vector_state"])
+        self.assertEqual([updated], self.db.list_repair_operations())
+
     def test_wakeup_excludes_retracted_and_returns_three_recall_hints(self):
         self.db.insert("gone", "retracted item", salience=1.0)
         self.db.retract("gone", retracted_by="replacement")
@@ -442,6 +459,20 @@ class DataCorrectnessTests(unittest.TestCase):
         self.assertEqual(1, repaired["removed_chroma_orphans"])
         self.assertNotIn("chroma-only", memory._collection.ids)
 
+    def test_reconcile_reports_pending_repair_operations_without_applying_them(self):
+        self.db.start_repair_operation(
+            "pending-store", "store", memory_id="missing-vector",
+            intended_state={"memory_id": "missing-vector", "text_sha256": "fixture"},
+        )
+        memory = AnchorMemory.__new__(AnchorMemory)
+        memory.db = self.db
+        memory._collection = FakeCollection()
+
+        report = AnchorMemory.reconcile(memory)
+
+        self.assertEqual(1, report["repair_pending_count"])
+        self.assertEqual("pending-store", report["repair_operations"][0]["op_id"])
+
     def test_legacy_continuity_header_is_neutralized_without_losing_body(self):
         pinned = os.path.join(self.tempdir.name, "pinned")
         write_session_state(pinned, LEGACY_CONTINUITY_HEADER + "\n\nbody stays")
@@ -465,6 +496,102 @@ class DataCorrectnessTests(unittest.TestCase):
 
         self.assertEqual("original", memory._collection.records["same"]["document"])
         self.assertEqual([1.0], memory._collection.records["same"]["embedding"])
+
+    def test_store_sqlite_failure_is_recorded_as_rolled_back_repair_operation(self):
+        memory = AnchorMemory.__new__(AnchorMemory)
+        memory._collection = SnapshotCollection()
+        memory._embedder = FakeEmbedder()
+        memory.db = self.db
+        memory._eager_link = False
+
+        with patch.object(self.db, "insert", side_effect=RuntimeError("injected sqlite failure")):
+            with self.assertRaisesRegex(RuntimeError, "injected sqlite failure"):
+                AnchorMemory.store(memory, "same", "replacement")
+
+        operations = self.db.list_repair_operations(("rolled_back",))
+        self.assertEqual(1, len(operations))
+        self.assertEqual("store", operations[0]["op_type"])
+        self.assertEqual("failed", operations[0]["sqlite_state"])
+        self.assertEqual("rolled_back", operations[0]["vector_state"])
+        self.assertEqual("original", memory._collection.records["same"]["document"])
+
+    def test_store_records_completed_repair_operation(self):
+        memory = AnchorMemory.__new__(AnchorMemory)
+        memory._collection = SnapshotCollection()
+        memory._embedder = FakeEmbedder()
+        memory.db = self.db
+        memory._eager_link = False
+
+        self.assertEqual("new", AnchorMemory.store(memory, "new", "durable event"))
+
+        operation = self.db.list_repair_operations(("applied",))[0]
+        self.assertEqual("store", operation["op_type"])
+        self.assertEqual("new", operation["memory_id"])
+        self.assertEqual("applied", operation["sqlite_state"])
+        self.assertEqual("applied", operation["vector_state"])
+        self.assertNotIn("durable event", str(operation["intended_state"]))
+
+    def test_delete_sqlite_failure_is_recorded_as_rolled_back_repair_operation(self):
+        self.db.insert("same", "original")
+        memory = AnchorMemory.__new__(AnchorMemory)
+        memory._collection = SnapshotCollection()
+        memory.db = self.db
+
+        with patch.object(self.db, "delete", side_effect=RuntimeError("injected sqlite delete failure")):
+            with self.assertRaisesRegex(RuntimeError, "injected sqlite delete failure"):
+                AnchorMemory.delete(memory, "same")
+
+        operations = self.db.list_repair_operations(("rolled_back",))
+        self.assertEqual(1, len(operations))
+        self.assertEqual("delete", operations[0]["op_type"])
+        self.assertEqual("failed", operations[0]["sqlite_state"])
+        self.assertEqual("rolled_back", operations[0]["vector_state"])
+        self.assertIsNotNone(self.db.get("same"))
+        self.assertEqual("original", memory._collection.records["same"]["document"])
+
+    def test_merge_is_atomic_in_sqlite_and_records_completed_dual_store_operation(self):
+        for memory_id in ("survivor", "duplicate", "neighbor"):
+            self.db.insert(memory_id, memory_id)
+        self.db.connect("duplicate", "neighbor", weight=1.25, relation="contradicts")
+        memory = AnchorMemory.__new__(AnchorMemory)
+        memory.db = self.db
+        memory._collection = SnapshotCollection()
+        memory._collection.records["survivor"] = {
+            "embedding": [2.0], "document": "survivor", "metadata": {"memory_id": "survivor"},
+        }
+        memory._collection.records["duplicate"] = {
+            "embedding": [3.0], "document": "duplicate", "metadata": {"memory_id": "duplicate"},
+        }
+
+        result = AnchorMemory.merge_memories(memory, "survivor", "duplicate")
+
+        self.assertTrue(result["duplicate_deleted"])
+        self.assertIsNone(self.db.get("duplicate"))
+        self.assertNotIn("duplicate", memory._collection.records)
+        self.assertAlmostEqual(1.25, self.db.get_edge_weight("survivor", "neighbor"))
+        operation = self.db.list_repair_operations(("applied",))[0]
+        self.assertEqual("merge", operation["op_type"])
+        self.assertEqual(["duplicate"], operation["related_ids"])
+
+    def test_merge_sqlite_failure_restores_duplicate_vector_and_records_rollback(self):
+        self.db.insert("survivor", "survivor")
+        self.db.insert("duplicate", "duplicate")
+        memory = AnchorMemory.__new__(AnchorMemory)
+        memory.db = self.db
+        memory._collection = SnapshotCollection()
+        memory._collection.records["duplicate"] = {
+            "embedding": [3.0], "document": "duplicate", "metadata": {"memory_id": "duplicate"},
+        }
+
+        with patch.object(self.db, "merge_duplicate_into", side_effect=RuntimeError("injected merge failure")):
+            with self.assertRaisesRegex(RuntimeError, "injected merge failure"):
+                AnchorMemory.merge_memories(memory, "survivor", "duplicate")
+
+        self.assertIsNotNone(self.db.get("duplicate"))
+        self.assertIn("duplicate", memory._collection.records)
+        operation = self.db.list_repair_operations(("rolled_back",))[0]
+        self.assertEqual("merge", operation["op_type"])
+        self.assertEqual("rolled_back", operation["vector_state"])
 
     def test_unconfirmed_content_cannot_enter_core_layer(self):
         memory = AnchorMemory.__new__(AnchorMemory)

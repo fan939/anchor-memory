@@ -203,6 +203,26 @@ class AnchorDB:
                     error TEXT NOT NULL DEFAULT ''
                 )
             """)
+            # Repair journal records the coordination state of mutations that
+            # touch both SQLite and the vector store.  It intentionally stores
+            # identifiers and hashes only: recovery metadata must never become
+            # a second copy of private memory text.
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS repair_journal (
+                    op_id TEXT PRIMARY KEY,
+                    op_type TEXT NOT NULL,
+                    memory_id TEXT NOT NULL DEFAULT '',
+                    related_ids_json TEXT NOT NULL DEFAULT '[]',
+                    intended_state_json TEXT NOT NULL DEFAULT '{}',
+                    sqlite_state TEXT NOT NULL DEFAULT 'pending',
+                    vector_state TEXT NOT NULL DEFAULT 'pending',
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    error TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+            """)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_repair_journal_status ON repair_journal(status)")
             conn.commit()
         self._ensure_context_column()
         self._ensure_visual_column()
@@ -1559,6 +1579,61 @@ class AnchorDB:
             conn.commit()
         return migrated
 
+    def merge_duplicate_into(self, survivor_id: str, duplicate_id: str, *,
+                             usage_count: int, timestamp: str, pinned: int,
+                             emotion_score: float) -> int:
+        """Atomically migrate graph state and remove a confirmed storage duplicate.
+
+        This is deliberately a storage operation, not an epistemic update: the
+        caller has already selected a survivor and the duplicate is physically
+        removed only when it has no Reflection source references.
+        """
+        now = _utc_now_iso()
+        with self._conn() as conn:
+            referenced = conn.execute(
+                "SELECT 1 FROM reflection_sources WHERE memory_id = ? LIMIT 1", (duplicate_id,)
+            ).fetchone()
+            if referenced:
+                raise ValueError(
+                    "Cannot merge a duplicate referenced by a Reflection; retract or supersede it instead"
+                )
+            outgoing = conn.execute(
+                "SELECT target_id, weight, relation FROM edges WHERE source_id = ?", (duplicate_id,)
+            ).fetchall()
+            incoming = conn.execute(
+                "SELECT source_id, weight, relation FROM edges WHERE target_id = ?", (duplicate_id,)
+            ).fetchall()
+            migrated = 0
+            for row in outgoing:
+                self._upsert_edge(
+                    conn, survivor_id, row["target_id"], row["weight"], now, row["relation"]
+                )
+                migrated += 1
+            for row in incoming:
+                self._upsert_edge(
+                    conn, row["source_id"], survivor_id, row["weight"], now, row["relation"]
+                )
+                migrated += 1
+            conn.execute(
+                "UPDATE memories SET usage_count = ?, timestamp = ?, pinned = ?, emotion_score = ?, "
+                "updated_at = ? WHERE memory_id = ?",
+                (usage_count, timestamp, pinned, emotion_score, now, survivor_id),
+            )
+            conn.execute(
+                "DELETE FROM edges WHERE source_id = ? OR target_id = ?", (duplicate_id, duplicate_id)
+            )
+            conn.execute("DELETE FROM memories WHERE memory_id = ?", (duplicate_id,))
+            conn.execute(
+                "INSERT INTO events (memory_id, event_type, detail, created_at) VALUES (?, ?, ?, ?)",
+                (
+                    survivor_id, "merged",
+                    f"from={duplicate_id} edges_migrated={migrated} usage={usage_count} "
+                    f"ts={timestamp} pinned={pinned} emotion={emotion_score:.2f}",
+                    now,
+                ),
+            )
+        return migrated
+
     def decay_edges(self, min_weight: float = 0.1, decay_factor: float = 0.9) -> int:
         """Weaken all edges by decay_factor. Delete edges below min_weight."""
         with self._conn() as conn:
@@ -1669,6 +1744,90 @@ class AnchorDB:
                  error, run_id),
             )
         return self.get_maintenance_run(run_id)
+
+    # ── Dual-store repair journal ──
+
+    def start_repair_operation(self, op_id: str, op_type: str, memory_id: str = "",
+                               related_ids: list = None, intended_state: dict = None) -> dict:
+        """Persist a non-secret, idempotent record before a dual-store mutation."""
+        if not str(op_id).strip():
+            raise ValueError("op_id is required")
+        if op_type not in {"store", "delete", "retract", "merge", "expire", "reconcile"}:
+            raise ValueError("unsupported repair operation")
+        now = _utc_now_iso()
+        with self._conn() as conn:
+            conn.execute(
+                "INSERT INTO repair_journal "
+                "(op_id, op_type, memory_id, related_ids_json, intended_state_json, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(op_id) DO NOTHING",
+                (
+                    op_id, op_type, memory_id,
+                    json.dumps(list(related_ids or []), ensure_ascii=False, sort_keys=True),
+                    json.dumps(intended_state or {}, ensure_ascii=False, sort_keys=True),
+                    now, now,
+                ),
+            )
+        return self.get_repair_operation(op_id)
+
+    def update_repair_operation(self, op_id: str, *, sqlite_state: str = None,
+                                vector_state: str = None, status: str = None,
+                                error: str = None) -> dict:
+        """Advance a journal operation without discarding its original intent."""
+        allowed_states = {"pending", "applied", "not_needed", "failed", "needs_repair", "rolled_back"}
+        allowed_statuses = {"pending", "applied", "needs_repair", "rolled_back"}
+        updates, params = [], []
+        if sqlite_state is not None:
+            if sqlite_state not in allowed_states:
+                raise ValueError("unsupported sqlite_state")
+            updates.append("sqlite_state = ?")
+            params.append(sqlite_state)
+        if vector_state is not None:
+            if vector_state not in allowed_states:
+                raise ValueError("unsupported vector_state")
+            updates.append("vector_state = ?")
+            params.append(vector_state)
+        if status is not None:
+            if status not in allowed_statuses:
+                raise ValueError("unsupported repair status")
+            updates.append("status = ?")
+            params.append(status)
+        if error is not None:
+            updates.append("error = ?")
+            params.append(str(error)[:1000])
+        if not updates:
+            return self.get_repair_operation(op_id)
+        updates.append("updated_at = ?")
+        params.extend([_utc_now_iso(), op_id])
+        with self._conn() as conn:
+            cursor = conn.execute(
+                f"UPDATE repair_journal SET {', '.join(updates)} WHERE op_id = ?", params
+            )
+        if not cursor.rowcount:
+            raise ValueError(f"repair operation not found: {op_id}")
+        return self.get_repair_operation(op_id)
+
+    def get_repair_operation(self, op_id: str) -> dict | None:
+        with self._conn() as conn:
+            row = conn.execute("SELECT * FROM repair_journal WHERE op_id = ?", (op_id,)).fetchone()
+        if not row:
+            return None
+        result = dict(row)
+        result["related_ids"] = self._json_value(result.pop("related_ids_json"), [])
+        result["intended_state"] = self._json_value(result.pop("intended_state_json"), {})
+        return result
+
+    def list_repair_operations(self, statuses: tuple[str, ...] = ("pending", "needs_repair")) -> list:
+        """Return recovery work only by default, oldest first."""
+        if not statuses:
+            return []
+        placeholders = ", ".join("?" for _ in statuses)
+        with self._conn() as conn:
+            rows = conn.execute(
+                f"SELECT op_id FROM repair_journal WHERE status IN ({placeholders}) ORDER BY created_at ASC",
+                tuple(statuses),
+            ).fetchall()
+        return [self.get_repair_operation(row["op_id"]) for row in rows]
 
     # ── Pinning ──
 
