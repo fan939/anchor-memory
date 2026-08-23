@@ -29,6 +29,28 @@ report and backup have been reviewed:
 python scripts/migrate_reflection.py --db-path /data/anchor
 ```
 
+The SQLite/Chroma consistency check is also read-only by default. Run the
+preview first and inspect only IDs, counts, and repair reasons:
+
+```sh
+python scripts/reconcile.py --db-path /data/anchor
+```
+
+After a verified backup exists, an operator may apply vector-only repairs by
+passing the existing backup path. The command rechecks the state after repair
+and exits non-zero if anything remains inconsistent:
+
+```sh
+python scripts/reconcile.py \
+  --db-path /data/anchor \
+  --apply \
+  --backup /backups/anchor-<timestamp>.tar.gz
+```
+
+The reconcile report never includes memory text; do not paste backup paths,
+database files, or report contents containing private data into chat. Pending
+repair-journal entries remain review items and are not silently replayed.
+
 ```sh
 docker compose config
 docker compose build
