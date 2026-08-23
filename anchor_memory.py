@@ -912,12 +912,29 @@ class AnchorMemory:
         previous = self.db.get(memory_id)
         if not previous:
             raise ValueError(f"memory not found: {memory_id}")
-        updated = self.db.update_recall_state(
-            memory_id, salience=salience, motifs=motifs, state=state,
-            unresolved=unresolved, open_questions=open_questions,
-        )
+        repair_op_id = f"metadata_{uuid.uuid4().hex}"
+        journal_start = getattr(self.db, "start_repair_operation", None)
+        journal_update = getattr(self.db, "update_repair_operation", None)
+        vector = None
+        if journal_start:
+            journal_start(
+                repair_op_id, "metadata", memory_id=memory_id,
+                intended_state={
+                    "action": "update_recall_state", "memory_id": memory_id,
+                    "fields": sorted(name for name, value in {
+                        "salience": salience, "motifs": motifs, "state": state,
+                        "unresolved": unresolved, "open_questions": open_questions,
+                    }.items() if value is not None),
+                },
+            )
         try:
             vector = self._vectors().get(ids=[memory_id], include=["metadatas"])
+            updated = self.db.update_recall_state(
+                memory_id, salience=salience, motifs=motifs, state=state,
+                unresolved=unresolved, open_questions=open_questions,
+            )
+            if journal_update:
+                journal_update(repair_op_id, sqlite_state="applied")
             if vector.get("ids"):
                 metadata = dict(vector["metadatas"][0] or {})
                 metadata.update({
@@ -925,14 +942,40 @@ class AnchorMemory:
                     "state": updated.get("state", "active"),
                 })
                 self._vectors().update(ids=[memory_id], metadatas=[metadata])
+                vector_state = "applied"
+            else:
+                vector_state = "not_needed"
+            if journal_update:
+                journal_update(
+                    repair_op_id, sqlite_state="applied", vector_state=vector_state,
+                    status="applied",
+                )
             return updated
-        except Exception:
-            self.db.update_recall_state(
-                memory_id, salience=previous.get("salience"),
-                motifs=previous.get("motifs"), state=previous.get("state"),
-                unresolved=previous.get("unresolved"),
-                open_questions=previous.get("open_questions"),
-            )
+        except Exception as exc:
+            sqlite_rolled_back = False
+            vector_rolled_back = vector is None or not vector.get("ids")
+            try:
+                self.db.update_recall_state(
+                    memory_id, salience=previous.get("salience"),
+                    motifs=previous.get("motifs"), state=previous.get("state"),
+                    unresolved=previous.get("unresolved"),
+                    open_questions=previous.get("open_questions"),
+                )
+                sqlite_rolled_back = True
+                if vector is not None and vector.get("ids"):
+                    self._vectors().update(
+                        ids=[memory_id], metadatas=[dict(vector["metadatas"][0] or {})]
+                    )
+                    vector_rolled_back = True
+            finally:
+                if journal_update:
+                    journal_update(
+                        repair_op_id,
+                        sqlite_state="rolled_back" if sqlite_rolled_back else "needs_repair",
+                        vector_state="rolled_back" if vector_rolled_back else "needs_repair",
+                        status="rolled_back" if sqlite_rolled_back and vector_rolled_back else "needs_repair",
+                        error=f"{type(exc).__name__}: {exc}",
+                    )
             raise
 
     def reconcile_recall_metadata(self, dry_run: bool = True,

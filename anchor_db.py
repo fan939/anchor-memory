@@ -1752,7 +1752,7 @@ class AnchorDB:
         """Persist a non-secret, idempotent record before a dual-store mutation."""
         if not str(op_id).strip():
             raise ValueError("op_id is required")
-        if op_type not in {"store", "delete", "retract", "merge", "expire", "reconcile"}:
+        if op_type not in {"store", "delete", "retract", "merge", "expire", "reconcile", "metadata"}:
             raise ValueError("unsupported repair operation")
         now = _utc_now_iso()
         with self._conn() as conn:

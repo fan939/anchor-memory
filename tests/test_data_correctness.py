@@ -71,6 +71,18 @@ class FakeEmbedder:
         return types.SimpleNamespace(tolist=lambda: [9.0])
 
 
+class FailingMetadataVectorStore(FakeVectorStore):
+    def __init__(self):
+        super().__init__()
+        self.fail_once = True
+
+    def update(self, *, ids, metadatas) -> None:
+        if self.fail_once:
+            self.fail_once = False
+            raise RuntimeError("injected vector metadata failure")
+        super().update(ids=ids, metadatas=metadatas)
+
+
 class QueryCollection:
     def count(self):
         return 2
@@ -536,6 +548,25 @@ class DataCorrectnessTests(unittest.TestCase):
         self.assertEqual("reconcile", operation["op_type"])
         self.assertEqual("sqlite-only", operation["memory_id"])
         self.assertEqual("applied", operation["vector_state"])
+
+    def test_metadata_update_rolls_back_and_journals_vector_failure(self):
+        self.db.insert("metadata", "recall metadata", salience=0.2)
+        vector_store = FailingMetadataVectorStore()
+        vector_store.upsert(
+            ids=["metadata"], embeddings=[[1.0]], documents=["recall metadata"],
+            metadatas=[{"memory_id": "metadata", "salience": 0.2, "state": "active"}],
+        )
+        memory = AnchorMemory.__new__(AnchorMemory)
+        memory.db = self.db
+        memory._vector_store = vector_store
+
+        with self.assertRaisesRegex(RuntimeError, "injected vector metadata failure"):
+            AnchorMemory.update_recall_state(memory, "metadata", salience=0.9)
+
+        self.assertEqual(0.2, self.db.get("metadata")["salience"])
+        operation = self.db.list_repair_operations(("rolled_back",))[0]
+        self.assertEqual("metadata", operation["op_type"])
+        self.assertEqual("rolled_back", operation["sqlite_state"])
 
     def test_legacy_continuity_header_is_neutralized_without_losing_body(self):
         pinned = os.path.join(self.tempdir.name, "pinned")
