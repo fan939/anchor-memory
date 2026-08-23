@@ -124,7 +124,12 @@ def create_http_server(db_path: str, pinned_dir: str | None = None) -> FastMCP:
     async def readyz(_: Request):
         try:
             memory.db.list_all(limit=1)
-            memory._collection.count()
+            count = getattr(memory, "count", None)
+            if count is not None:
+                count()
+            else:
+                # Compatibility for lightweight test/embedding adapters.
+                memory._collection.count()
             return JSONResponse({"status": "ready"})
         except Exception:
             return JSONResponse({"status": "not_ready"}, status_code=503)
