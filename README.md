@@ -493,7 +493,7 @@ This feature was suggested by Veille & 吱吱 based on their single-system archi
 
 ## Release notes
 
-Per-version notes live in [`docs/release-notes/`](docs/release-notes/). Most recent: [v1.15.0](docs/release-notes/v1.15.0.md).
+Per-version notes live in [`docs/release-notes/`](docs/release-notes/). Most recent: [v1.15.1](docs/release-notes/v1.15.1.md).
 
 ## Origin
 

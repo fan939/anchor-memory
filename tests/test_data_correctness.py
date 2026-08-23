@@ -20,6 +20,7 @@ from anchor_db import AnchorDB
 from anchor_memory import AnchorMemory
 from anchor_pinned import CONTINUITY_HEADER, LEGACY_CONTINUITY_HEADER, write_session_state
 from anchor_proxy import curate_turn
+from anchor_mcp import format_wakeup_text
 
 
 class FakeCollection:
@@ -229,6 +230,47 @@ class DataCorrectnessTests(unittest.TestCase):
         self.assertEqual(2, len(audit["items"]))
         self.assertNotIn("sources", normal["items"][0])
         self.assertEqual(1, normal["items"][0]["counterevidence_count"])
+
+    def test_wakeup_reflections_excludes_retracted_sources(self):
+        self.db.insert("source", "event source", memory_layer="event")
+        self.db.create_reflection(
+            reflection_id="retracted-source-reflection", source_event_ids=["source"],
+            trigger_type="unresolved", selection_reason="fixture",
+            previous_interpretation="old", current_interpretation="new",
+            change_or_tension="changed", confidence=0.6,
+            open_questions=["Still open?"], counterevidence=[],
+            provenance={"fixture": "test"}, status="tentative",
+        )
+        self.db.retract("source", retracted_by="fixture")
+
+        normal = self.db.wakeup_reflections(limit=5)
+        searched = self.db.search_reflections(limit=5)
+
+        self.assertEqual([], normal["items"])
+        self.assertEqual(1, normal["policy"]["excluded_retracted_source_count"])
+        self.assertEqual([], searched)
+
+    def test_pinned_core_owns_pinned_bucket_not_identity_snapshot(self):
+        self.db.insert(
+            "pinned-core", "Pinned confirmed identity", memory_layer="core",
+            epistemic_status="confirmed",
+        )
+        self.db.pin("pinned-core")
+
+        result = self.db.wakeup(n_random=0, n_identity=5)
+
+        self.assertEqual([], [item["memory_id"] for item in result["identity_snapshot"]])
+        self.assertEqual(["pinned-core"], [item["memory_id"] for item in result["pinned"]])
+
+    def test_wakeup_text_includes_compact_reflection_when_present(self):
+        text = format_wakeup_text({
+            "recent_reflections": [{
+                "reflection_id": "r1", "status": "tentative", "confidence": 0.6,
+                "current_interpretation": "A compact interpretation",
+            }],
+        })
+        self.assertIn("Reviewed recent Reflections", text)
+        self.assertIn("A compact interpretation", text)
 
     def test_recall_metadata_reconciliation_is_reviewable_and_reflection_scoped(self):
         self.db.insert("source", "This remains an unresolved question.", memory_layer="event")

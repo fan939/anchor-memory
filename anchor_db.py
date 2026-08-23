@@ -610,7 +610,8 @@ class AnchorDB:
             ).fetchone()["n"]
             salience_seed_rows = conn.execute(
                 "SELECT memory_id, salience, memory_layer, pinned FROM memories m "
-                "WHERE " + visible + " AND salience = 0.5 "
+                "WHERE " + visible + " AND epistemic_status = 'confirmed' "
+                "AND salience = 0.5 "
                 "AND (memory_layer = 'core' OR pinned = 1) "
                 "ORDER BY pinned DESC, memory_layer DESC, timestamp DESC"
             ).fetchall()
@@ -997,6 +998,12 @@ class AnchorDB:
             params.append(trigger_type)
         if not include_retracted and status != "abandoned":
             clauses.append("r.status != 'abandoned'")
+            clauses.append(
+                "NOT EXISTS (SELECT 1 FROM reflection_sources rs "
+                "JOIN memories sm ON sm.memory_id = rs.memory_id "
+                "WHERE rs.reflection_id = r.reflection_id "
+                "AND (sm.epistemic_status = 'retracted' OR sm.state = 'superseded'))"
+            )
         where = " WHERE " + " AND ".join(clauses) if clauses else ""
         with self._conn() as conn:
             rows = conn.execute(
@@ -1014,11 +1021,22 @@ class AnchorDB:
             excluded_drafts = conn.execute(
                 "SELECT COUNT(*) AS n FROM reflections WHERE status = 'draft'"
             ).fetchone()["n"]
+            excluded_sources = conn.execute(
+                "SELECT COUNT(DISTINCT r.reflection_id) AS n FROM reflections r "
+                "JOIN reflection_sources rs ON rs.reflection_id = r.reflection_id "
+                "JOIN memories m ON m.memory_id = rs.memory_id "
+                "WHERE r.status != 'abandoned' "
+                "AND (m.epistemic_status = 'retracted' OR m.state = 'superseded')"
+            ).fetchone()["n"]
             if limit:
                 draft_clause = "" if include_drafts else " AND status != 'draft'"
                 rows = conn.execute(
                     "SELECT reflection_id FROM reflections "
                     "WHERE status != 'abandoned'" + draft_clause +
+                    " AND NOT EXISTS (SELECT 1 FROM reflection_sources rs "
+                    "JOIN memories m ON m.memory_id = rs.memory_id "
+                    "WHERE rs.reflection_id = reflections.reflection_id "
+                    "AND (m.epistemic_status = 'retracted' OR m.state = 'superseded'))" +
                     " ORDER BY created_at DESC LIMIT ?",
                     (limit,),
                 ).fetchall()
@@ -1048,6 +1066,7 @@ class AnchorDB:
             "policy": {
                 "include_drafts": bool(include_drafts),
                 "excluded_draft_count": 0 if include_drafts else int(excluded_drafts or 0),
+                "excluded_retracted_source_count": int(excluded_sources or 0),
                 "abandoned_always_excluded": True,
                 "detail_level": "compact",
             },
@@ -1788,12 +1807,13 @@ class AnchorDB:
                 )
 
             # Identity is a stable axis, not a side effect of recency. Confirmed
-            # Core memories own this section and are removed from later buckets.
+            # unpinned Core memories own this section; pin remains the canonical
+            # bucket for explicitly pinned memories so older clients do not miss it.
             identity = conn.execute(
                 "SELECT memory_id, text, tag, emotion_score, timestamp, context, "
                 "salience, motifs, state, unresolved, open_questions, memory_layer, "
                 "epistemic_status FROM memories WHERE memory_layer = 'core' "
-                f"AND epistemic_status = 'confirmed' AND {visible} "
+                f"AND epistemic_status = 'confirmed' AND pinned = 0 AND {visible} "
                 "ORDER BY pinned DESC, salience DESC, updated_at DESC LIMIT ?",
                 (n_identity,),
             ).fetchall() if n_identity > 0 else []

@@ -29,7 +29,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 import anchor_pinned
 
 
-SERVER_VERSION = "1.15.0"
+SERVER_VERSION = "1.15.1"
 TOOL_SCHEMA_VERSION = "1.4"
 TOOL_SCHEMA_META_KEY = "anchor/schema_version"
 
@@ -1274,7 +1274,11 @@ if __name__ == "__main__":
 
     if args.wakeup_text:
         from anchor_db import AnchorDB
-        data = AnchorDB(os.path.join(args.db_path, "memories.db")).wakeup()
+        db = AnchorDB(os.path.join(args.db_path, "memories.db"))
+        data = db.wakeup()
+        reflection_bundle = db.wakeup_reflections(limit=2, include_drafts=False)
+        data["recent_reflections"] = reflection_bundle["items"]
+        data["reflection_policy"] = reflection_bundle["policy"]
         for key, fname in (("session_state", anchor_pinned.SESSION_STATE),
                            ("recent_timeline", anchor_pinned.RECENT_TIMELINE),
                            ("last_session", anchor_pinned.LAST_SESSION)):
