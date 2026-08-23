@@ -21,6 +21,7 @@ from anchor_memory import AnchorMemory
 from anchor_pinned import CONTINUITY_HEADER, LEGACY_CONTINUITY_HEADER, write_session_state
 from anchor_proxy import curate_turn
 from anchor_mcp import format_wakeup_text
+from anchor_vector_store import FakeVectorStore
 
 
 class FakeCollection:
@@ -499,6 +500,26 @@ class DataCorrectnessTests(unittest.TestCase):
             [item["memory_id"] for item in report["repair_preview"]["remove_vectors"]],
         )
         self.assertTrue(report["repair_preview"]["apply_requires_backup"])
+
+    def test_reconcile_reports_vector_document_mismatch_without_exposing_text(self):
+        self.db.insert("same", "SQLite authority")
+        vector_store = FakeVectorStore()
+        vector_store.upsert(
+            ids=["same"], embeddings=[[1.0]], documents=["stale vector document"],
+            metadatas=[{"memory_id": "same"}],
+        )
+        memory = AnchorMemory.__new__(AnchorMemory)
+        memory.db = self.db
+        memory._vector_store = vector_store
+
+        report = AnchorMemory.reconcile(memory)
+
+        self.assertEqual(
+            [{"memory_id": "same", "reason": "VECTOR_DOCUMENT_MISMATCH"}],
+            report["mismatched_vectors"],
+        )
+        self.assertNotIn("SQLite authority", str(report))
+        self.assertNotIn("stale vector document", str(report))
 
     def test_legacy_continuity_header_is_neutralized_without_losing_body(self):
         pinned = os.path.join(self.tempdir.name, "pinned")

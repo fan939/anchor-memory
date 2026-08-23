@@ -38,6 +38,7 @@ class FakeMemory:
             "missing_vectors": [],
             "orphan_vectors": [],
             "audit_only_vectors": [],
+            "mismatched_vectors": [],
             "repair_preview": {},
         }
 

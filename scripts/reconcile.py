@@ -53,6 +53,7 @@ def main(argv=None, *, memory_factory=AnchorMemory, path_exists=os.path.exists) 
         report["after"]["missing_vectors"]
         + report["after"]["orphan_vectors"]
         + report["after"]["audit_only_vectors"]
+        + report["after"]["mismatched_vectors"]
     )
     report["clean"] = not remaining
     print(json.dumps(report, ensure_ascii=False, indent=2))

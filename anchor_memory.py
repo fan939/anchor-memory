@@ -31,6 +31,7 @@ import uuid
 import hashlib
 
 from anchor_db import AnchorDB
+from anchor_vector_store import ChromaVectorStore, VectorStoreProtocol
 
 
 class AnchorMemory:
@@ -52,6 +53,7 @@ class AnchorMemory:
             name="memories",
             metadata={"hnsw:space": "cosine"},
         )
+        self._vector_store: VectorStoreProtocol = ChromaVectorStore(self._collection)
         self._db_path = os.path.join(db_path, "memories.db")
         self.db = AnchorDB(self._db_path)
         # Eager concept-based linking on store(). Default OFF in v1.7.1 after
@@ -79,10 +81,18 @@ class AnchorMemory:
                 name="memories",
                 metadata={"hnsw:space": "cosine"},
             )
+            self._vector_store = ChromaVectorStore(self._collection)
+
+    def _vectors(self) -> VectorStoreProtocol:
+        """Return the adapter while preserving legacy collection access."""
+        vector_store = getattr(self, "_vector_store", None)
+        if vector_store is not None:
+            return vector_store
+        return ChromaVectorStore(self._collection)
 
     def count(self) -> int:
         """Total memory count."""
-        return self._collection.count()
+        return self._vectors().count()
 
     def _recency_boost(self, timestamp: str) -> float:
         """recency_weight · 0.5^(age_days / recency_halflife_days).
@@ -181,18 +191,19 @@ class AnchorMemory:
             "memory_layer": memory_layer,
             "salience": float(salience),
             "state": state,
+            "text_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
         }
         if source:
             meta["source"] = source
         if entity:
             meta["entity"] = entity
 
-        previous_vector = self._collection.get(
+        previous_vector = self._vectors().get(
             ids=[memory_id], include=["embeddings", "documents", "metadatas"]
         )
 
         try:
-            self._collection.upsert(
+            self._vectors().upsert(
                 ids=[memory_id],
                 embeddings=[embedding],
                 documents=[text],
@@ -211,7 +222,7 @@ class AnchorMemory:
         # Emotion score propagation: if default, check nearest neighbors
         if emotion_score == 0.5:
             try:
-                neighbors = self._collection.query(
+                neighbors = self._vectors().query(
                     query_embeddings=[embedding], n_results=3,
                     include=["metadatas"],
                 )
@@ -247,14 +258,14 @@ class AnchorMemory:
             rolled_back = False
             try:
                 if previous_vector.get("ids"):
-                    self._collection.upsert(
+                    self._vectors().upsert(
                         ids=previous_vector["ids"],
                         embeddings=previous_vector["embeddings"],
                         documents=previous_vector["documents"],
                         metadatas=previous_vector["metadatas"],
                     )
                 else:
-                    self._collection.delete(ids=[memory_id])
+                    self._vectors().delete(ids=[memory_id])
                 rolled_back = True
             finally:
                 if journal_update:
@@ -305,12 +316,29 @@ class AnchorMemory:
             row["memory_id"]: row for row in sqlite_rows
             if row.get("epistemic_status") != "retracted" and row.get("state") != "superseded"
         }
-        raw = self._collection.get(include=[])
+        raw = self._vectors().get(include=["documents", "metadatas"])
         chroma_ids = set(raw.get("ids", []))
+        vector_documents = dict(zip(raw.get("ids", []), raw.get("documents", [])))
+        vector_metadata = dict(zip(raw.get("ids", []), raw.get("metadatas", [])))
+        mismatched_vectors = []
+        for memory_id, row in active_rows.items():
+            if memory_id not in chroma_ids:
+                continue
+            text_hash = hashlib.sha256(row["text"].encode("utf-8")).hexdigest()
+            metadata = vector_metadata.get(memory_id) or {}
+            if vector_documents.get(memory_id) != row["text"]:
+                mismatched_vectors.append({
+                    "memory_id": memory_id, "reason": "VECTOR_DOCUMENT_MISMATCH",
+                })
+            elif metadata.get("text_sha256") and metadata["text_sha256"] != text_hash:
+                mismatched_vectors.append({
+                    "memory_id": memory_id, "reason": "VECTOR_TEXT_HASH_MISMATCH",
+                })
         report = {
             "missing_vectors": sorted(set(active_rows) - chroma_ids),
             "orphan_vectors": sorted(chroma_ids - sqlite_ids),
             "audit_only_vectors": sorted((sqlite_ids - set(active_rows)) & chroma_ids),
+            "mismatched_vectors": mismatched_vectors,
             "repair_operations": self.db.list_repair_operations(),
             "repair": repair,
         }
@@ -319,6 +347,8 @@ class AnchorMemory:
             "rebuild_vectors": [
                 {"memory_id": memory_id, "reason": "active SQLite memory has no vector"}
                 for memory_id in report["missing_vectors"]
+            ] + [
+                item for item in report["mismatched_vectors"]
             ],
             "remove_vectors": [
                 {"memory_id": memory_id, "reason": "vector has no SQLite record"}
@@ -336,7 +366,8 @@ class AnchorMemory:
                 for item in report["repair_operations"]
             ],
             "apply_requires_backup": bool(
-                report["orphan_vectors"] or report["audit_only_vectors"] or report["repair_operations"]
+                report["orphan_vectors"] or report["audit_only_vectors"]
+                or report["mismatched_vectors"] or report["repair_operations"]
             ),
         }
         # Backward-compatible names retained for operators/scripts upgrading
@@ -346,13 +377,16 @@ class AnchorMemory:
         if repair:
             remove_ids = report["orphan_vectors"] + report["audit_only_vectors"]
             if remove_ids:
-                self._collection.delete(ids=remove_ids)
+                self._vectors().delete(ids=remove_ids)
             rebuilt = []
-            for memory_id in report["missing_vectors"]:
+            rebuild_ids = report["missing_vectors"] + [
+                item["memory_id"] for item in report["mismatched_vectors"]
+            ]
+            for memory_id in rebuild_ids:
                 row = active_rows[memory_id]
                 if not hasattr(self._collection, "upsert") or not hasattr(self, "_embedder"):
                     continue
-                self._collection.upsert(
+                self._vectors().upsert(
                     ids=[memory_id],
                     embeddings=[self._embedder.encode(row["text"]).tolist()],
                     documents=[row["text"]],
@@ -362,6 +396,7 @@ class AnchorMemory:
                         "memory_layer": row.get("memory_layer", "event"),
                         "salience": float(row.get("salience", 0.5)),
                         "state": row.get("state", "active"),
+                        "text_sha256": hashlib.sha256(row["text"].encode("utf-8")).hexdigest(),
                     }],
                 )
                 rebuilt.append(memory_id)
@@ -397,14 +432,14 @@ class AnchorMemory:
         embedding = self._embedder.encode(query).tolist()
 
         where = {"tag": tag} if tag else None
-        count = self._collection.count()
+        count = self._vectors().count()
         if count == 0:
             return []
 
         candidates = []
         fetch_n = min(n_results * 3, count)
 
-        results = self._collection.query(
+        results = self._vectors().query(
             query_embeddings=[embedding],
             n_results=fetch_n,
             include=["documents", "metadatas", "distances"],
@@ -705,11 +740,11 @@ class AnchorMemory:
                 matched_ids.add(r["memory_id"])
 
         # Step 2: Embedding match for better coverage
-        if self._collection.count() > 0:
+        if self._vectors().count() > 0:
             embedding = self._embedder.encode(conversation_text).tolist()
-            results = self._collection.query(
+            results = self._vectors().query(
                 query_embeddings=[embedding],
-                n_results=min(top_n, self._collection.count()),
+                n_results=min(top_n, self._vectors().count()),
                 include=["metadatas", "distances"],
             )
             for meta, dist in zip(results["metadatas"][0], results["distances"][0]):
@@ -749,7 +784,7 @@ class AnchorMemory:
                 "Cannot hard-delete an event referenced by a Reflection; "
                 "retract or supersede it instead"
             )
-        previous_vector = self._collection.get(
+        previous_vector = self._vectors().get(
             ids=[memory_id], include=["embeddings", "documents", "metadatas"]
         )
         repair_op_id = f"{operation}_{uuid.uuid4().hex}"
@@ -761,7 +796,7 @@ class AnchorMemory:
                 intended_state={"memory_id": memory_id, "vector_present": bool(previous_vector.get("ids"))},
             )
         try:
-            self._collection.delete(ids=[memory_id])
+            self._vectors().delete(ids=[memory_id])
             if journal_update:
                 journal_update(repair_op_id, vector_state="applied")
             self.db.delete(memory_id)
@@ -774,7 +809,7 @@ class AnchorMemory:
             rolled_back = False
             try:
                 if previous_vector.get("ids"):
-                    self._collection.upsert(
+                    self._vectors().upsert(
                         ids=previous_vector["ids"], embeddings=previous_vector["embeddings"],
                         documents=previous_vector["documents"], metadatas=previous_vector["metadatas"],
                     )
@@ -794,7 +829,7 @@ class AnchorMemory:
         row = self.db.get(memory_id)
         if not row:
             return False
-        previous_vector = self._collection.get(
+        previous_vector = self._vectors().get(
             ids=[memory_id], include=["embeddings", "documents", "metadatas"]
         )
         repair_op_id = f"retract_{uuid.uuid4().hex}"
@@ -810,7 +845,7 @@ class AnchorMemory:
                 },
             )
         try:
-            self._collection.delete(ids=[memory_id])
+            self._vectors().delete(ids=[memory_id])
             if journal_update:
                 journal_update(repair_op_id, vector_state="applied")
             if not self.db.retract(memory_id, retracted_by):
@@ -824,7 +859,7 @@ class AnchorMemory:
             rolled_back = False
             try:
                 if previous_vector.get("ids"):
-                    self._collection.upsert(
+                    self._vectors().upsert(
                         ids=previous_vector["ids"], embeddings=previous_vector["embeddings"],
                         documents=previous_vector["documents"],
                         metadatas=previous_vector["metadatas"],
@@ -853,14 +888,14 @@ class AnchorMemory:
             unresolved=unresolved, open_questions=open_questions,
         )
         try:
-            vector = self._collection.get(ids=[memory_id], include=["metadatas"])
+            vector = self._vectors().get(ids=[memory_id], include=["metadatas"])
             if vector.get("ids"):
                 metadata = dict(vector["metadatas"][0] or {})
                 metadata.update({
                     "salience": float(updated.get("salience", 0.5)),
                     "state": updated.get("state", "active"),
                 })
-                self._collection.update(ids=[memory_id], metadatas=[metadata])
+                self._vectors().update(ids=[memory_id], metadatas=[metadata])
             return updated
         except Exception:
             self.db.update_recall_state(
@@ -966,7 +1001,7 @@ class AnchorMemory:
         d_emo = d.get("emotion_score") if d.get("emotion_score") is not None else 0.5
         new_emo = max(s_emo, d_emo)
 
-        previous_vector = self._collection.get(
+        previous_vector = self._vectors().get(
             ids=[duplicate_id], include=["embeddings", "documents", "metadatas"]
         )
         repair_op_id = f"merge_{uuid.uuid4().hex}"
@@ -981,7 +1016,7 @@ class AnchorMemory:
                 },
             )
         try:
-            self._collection.delete(ids=[duplicate_id])
+            self._vectors().delete(ids=[duplicate_id])
             if journal_update:
                 journal_update(repair_op_id, vector_state="applied")
             edges_migrated = self.db.merge_duplicate_into(
@@ -996,7 +1031,7 @@ class AnchorMemory:
             rolled_back = False
             try:
                 if previous_vector.get("ids"):
-                    self._collection.upsert(
+                    self._vectors().upsert(
                         ids=previous_vector["ids"], embeddings=previous_vector["embeddings"],
                         documents=previous_vector["documents"], metadatas=previous_vector["metadatas"],
                     )
