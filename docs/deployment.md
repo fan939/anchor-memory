@@ -51,6 +51,17 @@ The reconcile report never includes memory text; do not paste backup paths,
 database files, or report contents containing private data into chat. Pending
 repair-journal entries remain review items and are not silently replayed.
 
+For a repeatable read-only recall audit, inspect effective-memory counts,
+salience thresholds, unresolved/open-question counts, wakeup IDs, and storage
+parity without exposing memory bodies:
+
+```sh
+python scripts/audit_recall_state.py --db-path /data/anchor
+```
+
+This command has no repair or apply mode. A non-zero exit code means the
+read-only reconcile section still reports drift; it does not attempt to fix it.
+
 ```sh
 docker compose config
 docker compose build
