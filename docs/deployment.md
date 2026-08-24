@@ -1,7 +1,8 @@
 # Tencent Cloud deployment
 
-Do not expose port 8000 to the public internet. Caddy is the only public entry
-point and publishes ports 80/443. The application volume contains private data.
+Do not expose port 8000 to the public internet. In the Tencent Cloud production
+layout, host Nginx is the only public entry point; Anchor binds only to
+`127.0.0.1:8100`. The application volume contains private data.
 
 ## Prerequisites
 
@@ -18,6 +19,30 @@ point and publishes ports 80/443. The application volume contains private data.
 Copy `.env.example` to `.env`. Set `ANCHOR_DOMAIN`,
 `ANCHOR_PUBLIC_BASE_URL`, and generate `ANCHOR_AUTH_TOKEN` with a cryptographic
 random generator. Never paste the token into source control or chat logs.
+
+## Stable production deployment
+
+The production data and model-cache volumes are deliberately external and
+named `anchor-memory-data` and `anchor-memory-model-cache`. Never run a Compose
+project that creates prefixed replacement volumes: it would start Anchor with
+an empty memory database.
+
+Use the deployment script from the checked-out release directory. It builds a
+versioned image, creates a backup archive under `/opt/anchor-backups`, keeps the
+previous container as a rollback target, and restores it automatically if the
+new health check fails:
+
+```sh
+sudo ./scripts/deploy_production.sh v2-<commit>
+```
+
+The script does not update source code for you. First update the release
+directory through your normal Git checkout/release-copy process, then run the
+command above. It does not print environment variables, tokens, or memory
+content.
+
+Nginx owns ports 80/443 and proxies this service to `127.0.0.1:8100`; do not
+start the old Compose Caddy service on this server.
 
 ## Validate before starting
 
@@ -63,10 +88,8 @@ This command has no repair or apply mode. A non-zero exit code means the
 read-only reconcile section still reports drift; it does not attempt to fix it.
 
 ```sh
-docker compose config
-docker compose build
-docker compose up -d
-docker compose ps
+docker-compose config
+sudo docker ps --format '{{.Names}} {{.Image}} {{.Status}}'
 curl -fsS https://memory.example.com/healthz
 curl -i https://memory.example.com/mcp
 ```

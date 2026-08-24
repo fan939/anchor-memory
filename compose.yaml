@@ -1,16 +1,20 @@
 services:
   anchor-memory:
+    # Explicit image/container/volume names keep production independent of the
+    # directory or Compose project name. They prevent an upgrade from silently
+    # creating a fresh, empty memory volume.
+    image: "anchor-memory:${ANCHOR_IMAGE_TAG:-local}"
     build: .
+    container_name: anchor-memory
     restart: unless-stopped
     env_file: .env
-    expose:
-      - "8000"
+    ports:
+      - "127.0.0.1:${ANCHOR_LOCAL_PORT:-8100}:8000"
     volumes:
-      - anchor-data:/data/anchor
-      - anchor-model-cache:/data/model-cache
+      - anchor-memory-data:/data/anchor
+      - anchor-memory-model-cache:/data/model-cache
     mem_limit: 2800m
     cpus: 3.0
-    read_only: true
     tmpfs:
       - /tmp:size=256m,mode=1777
     security_opt:
@@ -18,27 +22,12 @@ services:
     cap_drop:
       - ALL
 
-  caddy:
-    image: caddy:2.10-alpine
-    restart: unless-stopped
-    depends_on:
-      anchor-memory:
-        condition: service_healthy
-    environment:
-      ANCHOR_DOMAIN: ${ANCHOR_DOMAIN}
-    ports:
-      - "80:80"
-      - "443:443"
-    volumes:
-      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
-      - caddy-data:/data
-      - caddy-config:/config
-    mem_limit: 256m
-    security_opt:
-      - no-new-privileges:true
-
+# Production HTTPS is terminated by the host Nginx service. Do not add a
+# second proxy here: it would compete for ports 80/443 and hide the real path.
 volumes:
-  anchor-data:
-  anchor-model-cache:
-  caddy-data:
-  caddy-config:
+  anchor-memory-data:
+    external: true
+    name: ${ANCHOR_DATA_VOLUME:-anchor-memory-data}
+  anchor-memory-model-cache:
+    external: true
+    name: ${ANCHOR_MODEL_CACHE_VOLUME:-anchor-memory-model-cache}
