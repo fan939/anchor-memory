@@ -41,6 +41,17 @@ directory through your normal Git checkout/release-copy process, then run the
 command above. It does not print environment variables, tokens, or memory
 content.
 
+For a Git-managed production checkout, keep the environment file outside the
+repository at `/etc/anchor-memory/anchor.env` (owner `root`, mode `600`). The
+deployment script automatically prefers that file when it exists, so normal
+updates become:
+
+```sh
+cd /opt/anchor-memory-release
+git pull --ff-only
+sudo ./scripts/deploy_production.sh v2-<commit>
+```
+
 Nginx owns ports 80/443 and proxies this service to `127.0.0.1:8100`; do not
 start the old Compose Caddy service on this server.
 

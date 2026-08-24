@@ -27,6 +27,7 @@ class DeployContractTests(unittest.TestCase):
 
         self.assertIn('"$data_volume:/data/anchor:ro"', script)
         self.assertIn('"$backup_dir:/backups"', script)
+        self.assertIn("/etc/anchor-memory/anchor.env", script)
         self.assertIn("trap 'restore_previous' EXIT INT TERM HUP", script)
         self.assertIn('docker rename "$container_name" "$rollback_name"', script)
         self.assertIn('docker rename "$rollback_name" "$container_name"', script)

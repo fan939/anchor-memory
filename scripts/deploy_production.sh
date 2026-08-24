@@ -22,7 +22,11 @@ esac
 
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 project_dir=$(CDPATH= cd -- "$script_dir/.." && pwd)
-env_file="${ANCHOR_ENV_FILE:-$project_dir/.env}"
+default_env_file="$project_dir/.env"
+if [ -f /etc/anchor-memory/anchor.env ]; then
+    default_env_file=/etc/anchor-memory/anchor.env
+fi
+env_file="${ANCHOR_ENV_FILE:-$default_env_file}"
 data_volume="${ANCHOR_DATA_VOLUME:-anchor-memory-data}"
 model_volume="${ANCHOR_MODEL_CACHE_VOLUME:-anchor-memory-model-cache}"
 backup_dir="${ANCHOR_BACKUP_HOST_DIR:-/opt/anchor-backups}"
