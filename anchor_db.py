@@ -1092,7 +1092,34 @@ class AnchorDB:
             },
         }
 
-    def list_reflection_candidate_rows(self, limit: int = 50) -> list:
+    @staticmethod
+    def _unresolved_recall_eligibility(alias: str = "") -> str:
+        """Return the shared hard eligibility rule for unresolved recall.
+
+        This deliberately relies only on the memory's current structured state.
+        Historical wording is useful after eligibility has been established, but
+        must never revive a resolved, superseded, or retracted record.
+        """
+        prefix = f"{alias}." if alias else ""
+        return (
+            f"{prefix}unresolved = 1 "
+            f"AND {prefix}state = 'active' "
+            f"AND {prefix}epistemic_status != 'retracted' "
+            f"AND COALESCE({prefix}retracted_by, '') = '' "
+            f"AND TRIM(COALESCE({prefix}open_questions, '[]')) NOT IN ('', '[]', 'null')"
+        )
+
+    def list_reflection_candidate_rows(self, limit: int = 50,
+                                       unresolved_only: bool = False) -> list:
+        """List current event records eligible for Reflection consideration.
+
+        ``unresolved_only`` is intentionally a database-side hard filter. It
+        is shared with the wakeup unresolved bucket so stale vector metadata or
+        keywords in historical text cannot reintroduce archived records.
+        """
+        where = ["m.memory_layer = 'event'", "m.epistemic_status != 'retracted'"]
+        if unresolved_only:
+            where.append(self._unresolved_recall_eligibility("m"))
         with self._conn() as conn:
             rows = conn.execute(
                 """
@@ -1103,8 +1130,7 @@ class AnchorDB:
                 LEFT JOIN reflection_sources rs ON rs.memory_id = m.memory_id
                 LEFT JOIN reflections r ON r.reflection_id = rs.reflection_id
                     AND r.status != 'abandoned'
-                WHERE m.memory_layer = 'event'
-                  AND m.epistemic_status != 'retracted'
+                WHERE """ + " AND ".join(where) + """
                 GROUP BY m.memory_id
                 ORDER BY m.timestamp DESC LIMIT ?
                 """,
@@ -1114,6 +1140,8 @@ class AnchorDB:
         for row in rows:
             item = dict(row)
             item["provenance"] = self._json_value(item.get("provenance"), {})
+            item["open_questions"] = self._json_value(item.get("open_questions"), [])
+            item["unresolved"] = bool(item.get("unresolved"))
             result.append(item)
         return result
 
@@ -1991,7 +2019,7 @@ class AnchorDB:
             unresolved_rows = conn.execute(
                 "SELECT memory_id, text, tag, timestamp, salience, motifs, state, "
                 "unresolved, open_questions FROM memories "
-                f"WHERE unresolved = 1 AND {visible}{exclude} "
+                f"WHERE {self._unresolved_recall_eligibility()}{exclude} "
                 "ORDER BY salience DESC, timestamp DESC LIMIT ?",
                 excluded + [n_unresolved],
             ).fetchall() if n_unresolved > 0 else []

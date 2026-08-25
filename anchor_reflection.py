@@ -89,7 +89,13 @@ class ReflectionService:
         if trigger_type not in TRIGGER_TYPES:
             raise ValueError(f"Unsupported trigger_type: {trigger_type}")
         now = _now()
-        rows = self.db.list_reflection_candidate_rows(limit=500)
+        # The unresolved path intentionally applies its stricter eligibility at
+        # the database boundary, before cooldown/event-count/text reasoning.
+        # Other triggers retain the broader event-review candidate pool.
+        rows = self.db.list_reflection_candidate_rows(
+            limit=500,
+            unresolved_only=(trigger_type == "unresolved"),
+        )
         opportunity = self.db.reflection_opportunity_stats()
         latest_text = opportunity.get("latest_reflection_at", "")
         latest = self._parse_utc(latest_text) if latest_text else None

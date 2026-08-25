@@ -154,6 +154,62 @@ class ReflectionTests(unittest.TestCase):
         self.assertEqual("UTC", invited["opportunity"]["active_day_timezone"])
         self.assertEqual(saved["reflection_id"], self.db.get_reflections_for_event("event-1")[0]["reflection_id"])
 
+    def test_unresolved_candidates_use_current_metadata_not_historical_text(self):
+        self.db.update_recall_state(
+            "event-1", unresolved=True,
+            open_questions=["What evidence would settle this?"],
+        )
+        self.db.insert(
+            "mem_213e4495_event_a", "This 未决事项 was completed.",
+            memory_layer="event", state="resolved", unresolved=True,
+            open_questions=["Historical question"],
+        )
+        self.db.insert(
+            "mem_f9899080", "An 未完成 historical note.",
+            memory_layer="event", state="resolved", unresolved=False,
+            open_questions=[],
+        )
+        self.db.insert(
+            "mem_6fce4f80", "A historical 未决事项 is now complete.",
+            memory_layer="event", state="resolved", unresolved=False,
+            open_questions=[],
+        )
+        self.db.insert(
+            "mem_213e4495", "An 未完成 historical note.",
+            memory_layer="event", state="superseded", unresolved=True,
+            open_questions=["Historical question"],
+        )
+        self.db.insert(
+            "retracted-text-match", "A retracted 未决事项.",
+            memory_layer="event", unresolved=True,
+            open_questions=["Should never appear"],
+        )
+        self.db.retract("retracted-text-match", retracted_by="review")
+
+        candidates = self.service.list_candidates("unresolved", limit=20)["candidates"]
+        self.assertEqual(["event-1"], [item["memory_id"] for item in candidates])
+        wakeup = self.db.wakeup(n_unresolved=20)
+        self.assertEqual(
+            [item["memory_id"] for item in candidates],
+            [item["memory_id"] for item in wakeup["unresolved"]],
+        )
+
+    def test_unresolved_candidate_disappears_immediately_after_metadata_resolution(self):
+        self.db.update_recall_state(
+            "event-1", unresolved=True,
+            open_questions=["What is still open?"],
+        )
+        self.assertEqual(
+            ["event-1"],
+            [item["memory_id"] for item in self.service.list_candidates("unresolved")["candidates"]],
+        )
+
+        self.db.update_recall_state(
+            "event-1", state="resolved", unresolved=False, open_questions=[],
+        )
+        self.assertEqual([], self.service.list_candidates("unresolved")["candidates"])
+        self.assertEqual([], self.db.wakeup(n_unresolved=20)["unresolved"])
+
     def test_decision_link_rejects_unknown_reflection_without_partial_write(self):
         with self.assertRaisesRegex(ValueError, "Unknown reflection IDs"):
             self.db.record_reflection_effect(
