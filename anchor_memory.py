@@ -342,6 +342,10 @@ class AnchorMemory:
             "repair_operations": self.db.list_repair_operations(),
             "repair": repair,
         }
+        # Drives intentionally have no vector representation in the MVP. Their
+        # only reconciliation duty is auditing polymorphic links whose target
+        # was physically removed outside the Drive API.
+        report["orphan_drive_links"] = self.db.audit_drive_links()
         report["repair_pending_count"] = len(report["repair_operations"])
         report["repair_preview"] = {
             "rebuild_vectors": [

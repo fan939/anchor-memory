@@ -277,6 +277,59 @@ def create_http_server(db_path: str, pinned_dir: str | None = None) -> FastMCP:
     def unpin_memory(memory_id: str) -> dict[str, Any]:
         return invoke("unpin_memory", {"memory_id": memory_id})
 
+    @server.tool(description="Persist a current Drive without creating an action or changing memory state.", annotations=WRITE)
+    def create_drive(content: str, reason: str, strength: float, priority: int = 0,
+                     expires_at: str = "", decay_policy: dict[str, Any] | None = None,
+                     source_ref: str = "", provenance: dict[str, Any] | None = None,
+                     open_questions: list[str] | None = None,
+                     links: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+        return invoke("create_drive", {
+            "content": content, "reason": reason, "strength": strength, "priority": priority,
+            "expires_at": expires_at, "decay_policy": decay_policy or {"type": "none"},
+            "source_ref": source_ref, "provenance": provenance or {},
+            "open_questions": open_questions or [], "links": links or [],
+        })
+
+    @server.tool(description="List Drives with structured filters. Read-only.", annotations=READ_ONLY)
+    def list_drives(status: list[str] | None = None, min_strength: float = 0.3,
+                    min_priority: int = 0, include_expired: bool = False,
+                    limit: int = 20) -> dict[str, Any]:
+        return invoke("list_drives", {
+            "status": status or ["active"], "min_strength": min_strength,
+            "min_priority": min_priority, "include_expired": include_expired, "limit": limit,
+        })
+
+    @server.tool(description="Read one Drive with its links, provenance, and expiry state.", annotations=READ_ONLY)
+    def get_drive(drive_id: str) -> dict[str, Any]:
+        return invoke("get_drive", {"drive_id": drive_id})
+
+    @server.tool(description="Explicitly update a Drive; terminal Drives require a reason to reactivate.", annotations=WRITE)
+    def update_drive(drive_id: str, content: str | None = None, reason: str | None = None,
+                     strength: float | None = None, priority: int | None = None,
+                     status: str | None = None, expires_at: str | None = None,
+                     decay_policy: dict[str, Any] | None = None,
+                     open_questions: list[str] | None = None, completion_note: str | None = None,
+                     reactivate: bool = False, reactivation_reason: str = "") -> dict[str, Any]:
+        return invoke("update_drive", {
+            "drive_id": drive_id, "content": content, "reason": reason,
+            "strength": strength, "priority": priority, "status": status,
+            "expires_at": expires_at, "decay_policy": decay_policy,
+            "open_questions": open_questions, "completion_note": completion_note,
+            "reactivate": reactivate, "reactivation_reason": reactivation_reason,
+        })
+
+    @server.tool(description="Add or update a validated Drive relationship.", annotations=WRITE)
+    def link_drive(drive_id: str, target_type: str, target_id: str,
+                   relation: str, weight: float = 1.0) -> dict[str, Any]:
+        return invoke("link_drive", {
+            "drive_id": drive_id, "target_type": target_type,
+            "target_id": target_id, "relation": relation, "weight": weight,
+        })
+
+    @server.tool(description="Review Drive hygiene without changing any Drive.", annotations=READ_ONLY)
+    def review_drives(stale_days: int = 30, limit: int = 50) -> dict[str, Any]:
+        return invoke("review_drives", {"stale_days": stale_days, "limit": limit})
+
     @server.tool(description="List Reflection candidates without writing anything.", annotations=READ_ONLY)
     def list_reflection_candidates(
         trigger_type: str = "user_invite", limit: int = 5,

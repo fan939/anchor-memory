@@ -74,6 +74,8 @@ class McpReflectionTests(unittest.TestCase):
         self.assertIn("unpin_memory", by_name)
         self.assertIn("update_memory_metadata", by_name)
         self.assertIn("reconcile_recall_metadata", by_name)
+        for name in ("create_drive", "list_drives", "get_drive", "update_drive", "link_drive", "review_drives"):
+            self.assertIn(name, by_name)
         self.assertNotIn("update_memory_recall_state", by_name)
         wakeup = by_name["wakeup"]["inputSchema"]["properties"]
         self.assertEqual(5, wakeup["n_identity"]["default"])
@@ -85,6 +87,11 @@ class McpReflectionTests(unittest.TestCase):
             ["model", "thread_id", "context_ref", "extractor_version"],
             draft["properties"]["provenance"]["required"],
         )
+        create_drive = by_name["create_drive"]["inputSchema"]
+        self.assertEqual(1.0, create_drive["properties"]["strength"]["maximum"])
+        self.assertIn("motivated_by", create_drive["properties"]["links"]["items"]["properties"]["relation"]["enum"])
+        update_drive = by_name["update_drive"]["inputSchema"]
+        self.assertIn("reactivation_reason", update_drive["allOf"][0]["then"]["required"])
 
         failed = self.handle("set_tier", {"memory_id": "missing", "tier": "long"})
         self.assertFalse(failed["ok"])
@@ -107,6 +114,24 @@ class McpReflectionTests(unittest.TestCase):
         schema = by_name["reconcile_recall_metadata"]["inputSchema"]
         self.assertEqual(True, schema["properties"]["dry_run"]["default"])
         self.assertIn("maintenance_id", schema["allOf"][0]["then"]["required"])
+
+    def test_mcp_drive_minimum_closure(self):
+        created = self.handle("create_drive", {
+            "content": "Keep the project review explicit.",
+            "reason": "Avoid losing a current intention in event history.",
+            "strength": 0.8, "priority": 1, "provenance": PROVENANCE,
+            "links": [{
+                "target_type": "memory", "target_id": "event-mcp", "relation": "motivated_by",
+            }],
+        })
+        self.assertEqual("created", created["status"])
+        drive_id = created["drive"]["drive_id"]
+        listed = self.handle("list_drives", {"min_strength": 0.0})
+        self.assertEqual(drive_id, listed["drives"][0]["drive_id"])
+        updated = self.handle("update_drive", {
+            "drive_id": drive_id, "status": "satisfied", "completion_note": "Done.",
+        })
+        self.assertEqual("satisfied", updated["drive"]["status"])
 
     def test_mcp_minimum_reflection_closure(self):
         draft_args = {

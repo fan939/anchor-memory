@@ -29,8 +29,8 @@ sys.path.insert(0, os.path.dirname(__file__))
 import anchor_pinned
 
 
-SERVER_VERSION = "1.15.1"
-TOOL_SCHEMA_VERSION = "1.5"
+SERVER_VERSION = "1.16.0"
+TOOL_SCHEMA_VERSION = "1.6"
 TOOL_SCHEMA_META_KEY = "anchor/schema_version"
 
 
@@ -47,9 +47,11 @@ def create_server(db_path: str = "./anchor_data", pinned_dir: str = None):
     # must stay on the SQLite-only fast path — importing anchor_memory pulls
     # in sentence_transformers/chromadb (seconds).
     from anchor_memory import AnchorMemory
+    from anchor_drive import DriveService
     from anchor_reflection import ReflectionService
 
     mem = AnchorMemory(db_path=db_path)
+    drives = DriveService(mem.db)
     reflection = ReflectionService(mem.db)
     pinned_dir = pinned_dir or os.path.join(db_path, "pinned")
 
@@ -757,6 +759,106 @@ def create_server(db_path: str = "./anchor_data", pinned_dir: str = None):
             }],
         },
     })
+    drive_statuses = ["active", "paused", "satisfied", "abandoned", "superseded"]
+    drive_link_schema = {
+        "type": "object", "additionalProperties": False,
+        "properties": {
+            "target_type": {"type": "string", "enum": ["memory", "reflection", "drive"]},
+            "target_id": {"type": "string", "minLength": 1},
+            "relation": {"type": "string", "enum": [
+                "motivated_by", "supported_by", "conflicts_with", "depends_on", "supersedes", "related",
+            ]},
+            "weight": {"type": "number", "minimum": 0.0, "default": 1.0},
+        },
+        "required": ["target_type", "target_id", "relation"],
+    }
+    TOOLS.extend([
+        {
+            "name": "create_drive",
+            "description": "Persist a current Drive without creating an Outbox action or changing Memory/Reflection state.",
+            "inputSchema": {
+                "type": "object", "additionalProperties": False,
+                "properties": {
+                    "content": {"type": "string", "minLength": 1},
+                    "reason": {"type": "string", "minLength": 1},
+                    "strength": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+                    "priority": {"type": "integer", "default": 0},
+                    "expires_at": {"type": "string", "description": "Optional ISO-8601 datetime."},
+                    "decay_policy": {"type": "object", "additionalProperties": True, "default": {"type": "none"}},
+                    "source_ref": {"type": "string"},
+                    "provenance": {"type": "object", "additionalProperties": True, "default": {}},
+                    "open_questions": {"type": "array", "items": {"type": "string"}, "default": []},
+                    "links": {"type": "array", "items": drive_link_schema, "default": []},
+                },
+                "required": ["content", "reason", "strength"],
+            },
+        },
+        {
+            "name": "list_drives",
+            "description": "List Drives using structured status, priority, strength, and expiry filters. Read-only.",
+            "inputSchema": {
+                "type": "object", "additionalProperties": False,
+                "properties": {
+                    "status": {"type": "array", "items": {"type": "string", "enum": drive_statuses}, "default": ["active"]},
+                    "min_strength": {"type": "number", "minimum": 0.0, "maximum": 1.0, "default": 0.3},
+                    "min_priority": {"type": "integer", "default": 0},
+                    "include_expired": {"type": "boolean", "default": False},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 20},
+                },
+            },
+        },
+        {
+            "name": "get_drive",
+            "description": "Read one Drive, including provenance, open questions, links, expiry, and effective strength.",
+            "inputSchema": {
+                "type": "object", "additionalProperties": False,
+                "properties": {"drive_id": {"type": "string", "minLength": 1}},
+                "required": ["drive_id"],
+            },
+        },
+        {
+            "name": "update_drive",
+            "description": "Explicitly evolve a Drive. Restoring satisfied, abandoned, or superseded to active requires reactivate=true and a reason.",
+            "inputSchema": {
+                "type": "object", "additionalProperties": False,
+                "properties": {
+                    "drive_id": {"type": "string", "minLength": 1},
+                    "content": {"type": "string", "minLength": 1}, "reason": {"type": "string", "minLength": 1},
+                    "strength": {"type": "number", "minimum": 0.0, "maximum": 1.0}, "priority": {"type": "integer"},
+                    "status": {"type": "string", "enum": drive_statuses}, "expires_at": {"type": "string"},
+                    "decay_policy": {"type": "object", "additionalProperties": True},
+                    "open_questions": {"type": "array", "items": {"type": "string"}},
+                    "completion_note": {"type": "string"}, "reactivate": {"type": "boolean", "default": False},
+                    "reactivation_reason": {"type": "string"},
+                },
+                "required": ["drive_id"],
+                "allOf": [{
+                    "if": {"properties": {"reactivate": {"const": True}}, "required": ["reactivate"]},
+                    "then": {"required": ["reactivation_reason"]},
+                }],
+            },
+        },
+        {
+            "name": "link_drive",
+            "description": "Add or update an explicit Drive link after validating its target exists.",
+            "inputSchema": {
+                "type": "object", "additionalProperties": False,
+                "properties": {"drive_id": {"type": "string", "minLength": 1}, **drive_link_schema["properties"]},
+                "required": ["drive_id", "target_type", "target_id", "relation"],
+            },
+        },
+        {
+            "name": "review_drives",
+            "description": "Read-only Drive hygiene review; never changes Drive state or creates actions.",
+            "inputSchema": {
+                "type": "object", "additionalProperties": False,
+                "properties": {
+                    "stale_days": {"type": "integer", "minimum": 1, "default": 30},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 50},
+                },
+            },
+        },
+    ])
     for tool in TOOLS:
         tool["inputSchema"].setdefault("additionalProperties", False)
     tool_map["search_memory"]["inputSchema"]["properties"]["n"].update(
@@ -787,7 +889,7 @@ def create_server(db_path: str = "./anchor_data", pinned_dir: str = None):
         "search_memory", "search_multi", "get_memory", "get_neighbors",
         "get_annotations", "wakeup", "search_annotations",
         "list_reflection_candidates", "draft_reflection", "search_reflections",
-        "graph_stats", "get_comments", "get_links",
+        "graph_stats", "get_comments", "get_links", "list_drives", "get_drive", "review_drives",
     }
     destructive_tools = {
         "delete_memory", "dream_pass", "retract_memory", "retract_reflection",
@@ -796,7 +898,7 @@ def create_server(db_path: str = "./anchor_data", pinned_dir: str = None):
         "get_memory", "get_neighbors", "get_annotations", "wakeup",
         "search_annotations", "list_reflection_candidates", "draft_reflection",
         "search_reflections", "graph_stats", "get_comments", "get_links",
-        "pin_memory", "unpin_memory",
+        "pin_memory", "unpin_memory", "list_drives", "get_drive", "review_drives",
     }
     for tool in TOOLS:
         name = tool["name"]
@@ -933,6 +1035,24 @@ def create_server(db_path: str = "./anchor_data", pinned_dir: str = None):
 
             elif name == "reconcile":
                 return mem.reconcile(repair=args.get("repair", False))
+
+            elif name == "create_drive":
+                return drives.create(**args)
+
+            elif name == "list_drives":
+                return drives.list(**args)
+
+            elif name == "get_drive":
+                return drives.get(args["drive_id"])
+
+            elif name == "update_drive":
+                return drives.update(args.pop("drive_id"), **args)
+
+            elif name == "link_drive":
+                return drives.link(args.pop("drive_id"), **args)
+
+            elif name == "review_drives":
+                return drives.review(**args)
 
             elif name == "delete_memory":
                 success = mem.delete(args["memory_id"])

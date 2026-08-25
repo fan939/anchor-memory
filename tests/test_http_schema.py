@@ -94,12 +94,16 @@ class HttpSchemaTests(unittest.TestCase):
             "append_reflection_evidence", "retract_reflection",
             "record_memory_feedback", "update_memory_metadata", "get_links",
             "pin_memory", "unpin_memory", "reconcile_recall_metadata",
+            "create_drive", "list_drives", "get_drive", "update_drive",
+            "link_drive", "review_drives",
         }
         self.assertTrue(expected.issubset(by_name))
         self.assertTrue(by_name["draft_reflection"].annotations.readOnlyHint)
         self.assertFalse(by_name["save_reflection"].annotations.readOnlyHint)
         self.assertFalse(by_name["record_memory_feedback"].annotations.readOnlyHint)
         self.assertTrue(by_name["retract_reflection"].annotations.destructiveHint)
+        self.assertTrue(by_name["list_drives"].annotations.readOnlyHint)
+        self.assertFalse(by_name["create_drive"].annotations.readOnlyHint)
         self.assertIn("source_event_ids", by_name["draft_reflection"].inputSchema["properties"])
         draft_schema = by_name["draft_reflection"].inputSchema
         self.assertIn("user_invite", draft_schema["properties"]["trigger_type"]["enum"])

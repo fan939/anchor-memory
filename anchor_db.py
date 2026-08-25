@@ -229,6 +229,7 @@ class AnchorDB:
         self._ensure_provenance_columns()
         self._ensure_salience_columns()
         self._ensure_edge_metadata()
+        self._ensure_drive_tables()
 
     def _ensure_context_column(self):
         """Add context column if missing. text = search summary, context = full original."""
@@ -309,6 +310,206 @@ class AnchorDB:
             }
             if "relation" not in existing:
                 conn.execute("ALTER TABLE edges ADD COLUMN relation TEXT NOT NULL DEFAULT 'related'")
+
+    def _ensure_drive_tables(self):
+        """Create the independent Drive schema (safe to call on every start)."""
+        with self._conn() as conn:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS drives (
+                    drive_id TEXT PRIMARY KEY,
+                    content TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    status TEXT NOT NULL CHECK(status IN
+                        ('active', 'paused', 'satisfied', 'abandoned', 'superseded')),
+                    strength REAL NOT NULL CHECK(strength >= 0.0 AND strength <= 1.0),
+                    priority INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    last_endorsed_at TEXT NOT NULL,
+                    expires_at TEXT DEFAULT '',
+                    decay_policy_json TEXT NOT NULL DEFAULT '{"type":"none"}',
+                    source_ref TEXT DEFAULT '',
+                    provenance_json TEXT NOT NULL DEFAULT '{}',
+                    open_questions_json TEXT NOT NULL DEFAULT '[]',
+                    completion_note TEXT DEFAULT ''
+                )
+            """)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_drives_status_order "
+                         "ON drives(status, priority DESC, strength DESC, last_endorsed_at DESC)")
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS drive_links (
+                    drive_id TEXT NOT NULL,
+                    target_type TEXT NOT NULL CHECK(target_type IN ('memory', 'reflection', 'drive')),
+                    target_id TEXT NOT NULL,
+                    relation TEXT NOT NULL CHECK(relation IN
+                        ('motivated_by', 'supported_by', 'conflicts_with', 'depends_on', 'supersedes', 'related')),
+                    weight REAL NOT NULL DEFAULT 1.0 CHECK(weight >= 0.0),
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY (drive_id, target_type, target_id, relation),
+                    FOREIGN KEY (drive_id) REFERENCES drives(drive_id) ON DELETE RESTRICT
+                )
+            """)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_drive_links_target "
+                         "ON drive_links(target_type, target_id)")
+
+    # ── Drives: persistent current intentions, separate from memories ──
+
+    @staticmethod
+    def _decode_drive(row) -> dict:
+        item = dict(row)
+        item["decay_policy"] = AnchorDB._json_value(item.pop("decay_policy_json", "{}"), {})
+        item["provenance"] = AnchorDB._json_value(item.pop("provenance_json", "{}"), {})
+        item["open_questions"] = AnchorDB._json_value(item.pop("open_questions_json", "[]"), [])
+        return item
+
+    @staticmethod
+    def _drive_target_exists(conn, target_type: str, target_id: str) -> bool:
+        if target_type == "memory":
+            row = conn.execute("SELECT 1 FROM memories WHERE memory_id = ?", (target_id,)).fetchone()
+        elif target_type == "reflection":
+            row = conn.execute("SELECT 1 FROM reflections WHERE reflection_id = ?", (target_id,)).fetchone()
+        elif target_type == "drive":
+            row = conn.execute("SELECT 1 FROM drives WHERE drive_id = ?", (target_id,)).fetchone()
+        else:
+            return False
+        return row is not None
+
+    def create_drive(self, drive: dict, links: list[dict]) -> dict:
+        """Create a Drive and its validated links in one SQLite transaction."""
+        now = _utc_now_iso()
+        with self._conn() as conn:
+            for link in links:
+                if not self._drive_target_exists(conn, link["target_type"], link["target_id"]):
+                    raise ValueError(
+                        f"link target not found: {link['target_type']}:{link['target_id']}"
+                    )
+            conn.execute(
+                """INSERT INTO drives (
+                    drive_id, content, reason, status, strength, priority,
+                    created_at, updated_at, last_endorsed_at, expires_at,
+                    decay_policy_json, source_ref, provenance_json,
+                    open_questions_json, completion_note
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    drive["drive_id"], drive["content"], drive["reason"], drive["status"],
+                    drive["strength"], drive["priority"], now, now, now,
+                    drive["expires_at"], json.dumps(drive["decay_policy"], ensure_ascii=False),
+                    drive["source_ref"], json.dumps(drive["provenance"], ensure_ascii=False, sort_keys=True),
+                    json.dumps(drive["open_questions"], ensure_ascii=False), drive["completion_note"],
+                ),
+            )
+            for link in links:
+                conn.execute(
+                    """INSERT INTO drive_links
+                    (drive_id, target_type, target_id, relation, weight, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?)""",
+                    (drive["drive_id"], link["target_type"], link["target_id"],
+                     link["relation"], link["weight"], now),
+                )
+        self.log_event(drive["drive_id"], "drive_created", f"links={len(links)}")
+        return self.get_drive(drive["drive_id"])
+
+    def find_drive_duplicates(self, normalized_content: str, limit: int = 10) -> list[dict]:
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT drive_id, content, status, strength, priority, last_endorsed_at "
+                "FROM drives WHERE status IN ('active', 'paused')"
+            ).fetchall()
+        needle = " ".join(normalized_content.split()).casefold()
+        matches = [dict(row) for row in rows if " ".join(row["content"].split()).casefold() == needle]
+        return matches[:max(1, min(int(limit), 100))]
+
+    def get_drive(self, drive_id: str) -> dict | None:
+        with self._conn() as conn:
+            row = conn.execute("SELECT * FROM drives WHERE drive_id = ?", (drive_id,)).fetchone()
+            if row is None:
+                return None
+            item = self._decode_drive(row)
+            links = conn.execute(
+                "SELECT target_type, target_id, relation, weight, created_at "
+                "FROM drive_links WHERE drive_id = ? ORDER BY created_at, target_type, target_id",
+                (drive_id,),
+            ).fetchall()
+        item["links"] = [dict(link) for link in links]
+        return item
+
+    def list_drives(self, statuses: list[str] | None = None, min_strength: float = 0.0,
+                    min_priority: int = 0, include_expired: bool = False,
+                    limit: int = 20, now: str | None = None) -> list[dict]:
+        statuses = statuses or ["active"]
+        clauses = ["strength >= ?", "priority >= ?"]
+        params: list = [float(min_strength), int(min_priority)]
+        clauses.append("status IN (%s)" % ",".join("?" * len(statuses)))
+        params.extend(statuses)
+        if not include_expired:
+            clauses.append("(expires_at IS NULL OR expires_at = '' OR expires_at > ?)")
+            params.append(now or _utc_now_iso())
+        params.append(max(1, min(int(limit), 100)))
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT * FROM drives WHERE " + " AND ".join(clauses)
+                + " ORDER BY priority DESC, strength DESC, last_endorsed_at DESC LIMIT ?", params,
+            ).fetchall()
+        return [self._decode_drive(row) for row in rows]
+
+    def update_drive(self, drive_id: str, updates: dict, *, endorsed: bool = False) -> dict:
+        if not self.get_drive(drive_id):
+            raise ValueError(f"drive not found: {drive_id}")
+        allowed = {
+            "content", "reason", "strength", "priority", "status", "expires_at",
+            "decay_policy", "open_questions", "completion_note",
+        }
+        parts, params = [], []
+        for name, value in updates.items():
+            if name not in allowed:
+                continue
+            column = {
+                "decay_policy": "decay_policy_json", "open_questions": "open_questions_json",
+            }.get(name, name)
+            if name in {"decay_policy", "open_questions"}:
+                value = json.dumps(value, ensure_ascii=False, sort_keys=(name == "decay_policy"))
+            parts.append(f"{column} = ?")
+            params.append(value)
+        if not parts and not endorsed:
+            raise ValueError("at least one mutable Drive field is required")
+        now = _utc_now_iso()
+        parts.append("updated_at = ?")
+        params.append(now)
+        if endorsed:
+            parts.append("last_endorsed_at = ?")
+            params.append(now)
+        params.append(drive_id)
+        with self._conn() as conn:
+            conn.execute("UPDATE drives SET " + ", ".join(parts) + " WHERE drive_id = ?", params)
+        self.log_event(drive_id, "drive_updated", ",".join(sorted(updates)))
+        return self.get_drive(drive_id)
+
+    def link_drive(self, drive_id: str, link: dict) -> dict:
+        now = _utc_now_iso()
+        with self._conn() as conn:
+            if not conn.execute("SELECT 1 FROM drives WHERE drive_id = ?", (drive_id,)).fetchone():
+                raise ValueError(f"drive not found: {drive_id}")
+            if not self._drive_target_exists(conn, link["target_type"], link["target_id"]):
+                raise ValueError(f"link target not found: {link['target_type']}:{link['target_id']}")
+            conn.execute(
+                """INSERT INTO drive_links (drive_id, target_type, target_id, relation, weight, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(drive_id, target_type, target_id, relation) DO UPDATE SET weight = excluded.weight""",
+                (drive_id, link["target_type"], link["target_id"], link["relation"], link["weight"], now),
+            )
+        self.log_event(drive_id, "drive_linked", f"{link['relation']}:{link['target_type']}:{link['target_id']}")
+        return self.get_drive(drive_id)
+
+    def audit_drive_links(self) -> list[dict]:
+        """Report polymorphic targets that no longer exist; never repairs them."""
+        with self._conn() as conn:
+            rows = conn.execute("SELECT drive_id, target_type, target_id, relation FROM drive_links").fetchall()
+            orphans = []
+            for row in rows:
+                item = dict(row)
+                if not self._drive_target_exists(conn, item["target_type"], item["target_id"]):
+                    orphans.append(item)
+        return orphans
 
     # ── Event Log (immutable) ──
 
